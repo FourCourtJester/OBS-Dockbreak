@@ -212,34 +212,79 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 }
 
 /*
- * Clears the dock's transient parent, so its native window has no owner.
- * Returns true if there was one to clear.
+ * Makes a floating dock a window of its own: no owner, so minimising OBS
+ * leaves it alone, and a taskbar button, so it can be found again once OBS's
+ * main window is in front of it. Idempotent; returns true if anything changed.
  */
 bool DockBreak::release(QDockWidget *dock)
 {
 	QWindow *window = dock->windowHandle();
-	if (!window || !window->transientParent())
+	if (!window)
 		return false;
 
-	window->setTransientParent(nullptr);
+	bool changed = false;
+
+	if (window->transientParent()) {
+		window->setTransientParent(nullptr);
+		changed = true;
+	}
 
 #ifdef _WIN32
-	/*
-	 * Qt only pushes the transient parent to the HWND when the window is
-	 * next shown (QWindowsWindow::show_sys -> updateTransientParent). Inside
-	 * the Show filter that is about to happen anyway; for a dock that was
-	 * already on screen when we found it, it would not happen until the dock
-	 * was hidden and shown again. This is the same call Qt makes, applied
-	 * now, and it agrees with the state Qt has just been given.
-	 */
 	if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId())) {
+		/*
+		 * Qt only pushes the transient parent to the HWND when the window
+		 * is next shown (QWindowsWindow::show_sys -> updateTransientParent).
+		 * Inside the Show filter that is about to happen anyway; for a dock
+		 * that was already on screen when we found it, it would not happen
+		 * until the dock was hidden and shown again. This is the same call
+		 * Qt makes, applied now, and it agrees with the state Qt has just
+		 * been given.
+		 */
 		if (GetWindow(hwnd, GW_OWNER))
 			SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);
+
+		/*
+		 * A floating dock is a Qt::Tool window, which Qt creates with
+		 * WS_EX_TOOLWINDOW: no taskbar button. That was harmless while OBS
+		 * owned the dock, since an owned window always stays above its
+		 * owner. Unowned, clicking OBS can bury the dock, so it gets a
+		 * button of its own. WS_EX_APPWINDOW puts a visible top-level window
+		 * on the taskbar even when it is a tool window.
+		 *
+		 * Why not change the dock to Qt::Window instead: that swaps the
+		 * small tool caption for a full one, and Qt keeps the OUTER frame
+		 * when the frame changes. Every switch would then shift and resize
+		 * the dock's contents by the caption difference, and the dock would
+		 * creep a few pixels on each restart or Lock UI toggle. This bit
+		 * changes nothing about the frame, so Qt's geometry stays exact.
+		 *
+		 * Qt rewrites GWL_EXSTYLE whenever the dock's window flags change
+		 * (WindowCreationData::applyWindowFlags), which drops the bit. Each
+		 * such path ends in show(), so the Show filter puts it back, and
+		 * does so before ShowWindow() -- which is when the taskbar decides
+		 * whether a window gets a button.
+		 */
+		const LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+		if (!(exStyle & WS_EX_APPWINDOW)) {
+			SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle | WS_EX_APPWINDOW);
+			changed = true;
+
+			/* The taskbar only looks at the style when a window is shown,
+			 * so one already on screen gets its button the next time it
+			 * is. Only a dock floating before this plugin started gets
+			 * here, which a dock restored by OBS's layout does not. */
+			if (IsWindowVisible(hwnd))
+				obs_log(LOG_INFO,
+					"dock '%s' was already on screen -- its taskbar button appears when it is next shown",
+					dock_name(dock).constData());
+		}
 	}
 #endif
 
-	obs_log(LOG_INFO, "released floating dock '%s' from the main window", dock_name(dock).constData());
-	return true;
+	if (changed)
+		obs_log(LOG_INFO, "released floating dock '%s' from the main window", dock_name(dock).constData());
+
+	return changed;
 }
 
 void DockBreak::rememberGeometry(QDockWidget *dock)

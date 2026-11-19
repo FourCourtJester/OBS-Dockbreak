@@ -44,9 +44,12 @@ class QMainWindow;
  * WHAT THIS DOES
  *
  * It clears the transient parent of every floating dock, so the native window
- * has no owner and the OS leaves it alone. Nothing else changes: the dock keeps
- * its QWidget parent and its place in QMainWindow's layout. That matters,
- * because it means:
+ * has no owner and the OS leaves it alone. On Windows it also gives the window
+ * a taskbar button (WS_EX_APPWINDOW): an owned window always stays above its
+ * owner, an unowned one can end up behind OBS, and a button is the way back to
+ * it. Nothing else changes: the dock keeps its QWidget parent, its Qt::Tool
+ * window type and its place in QMainWindow's layout. That matters, because it
+ * means:
  *
  *  - OBS's own saveState()/restoreState() still records the dock as floating,
  *    with its geometry and visibility, so a detached dock survives a restart.

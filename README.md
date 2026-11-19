@@ -11,7 +11,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 | State | What Dockbreak does |
 | --- | --- |
 | Dock is in the main window | Nothing. |
-| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open. Remembers where it is. |
+| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open, and gives it a taskbar button. Remembers where it is. |
 | Popped-out dock is docked again | Nothing. Its last position is kept, so if it is popped out again (float button, double-click on the title bar, or the Docks menu) it reappears in the same place. |
 
 - A dock that was popped out when OBS closed comes back popped out and independent when OBS starts. OBS restores the layout; Dockbreak releases the dock.
@@ -24,7 +24,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 
 A floating `QDockWidget` is a top-level window whose Qt parent is still the main window. Qt gives it the main window as its *transient parent*. On Windows that becomes the native **owner** of the window, and Windows hides owned windows when their owner is minimised. Qt itself does not hide it.
 
-Dockbreak clears the transient parent of each floating dock, so the window has no owner. It does not reparent the dock:
+Dockbreak clears the transient parent of each floating dock, so the window has no owner. It also sets `WS_EX_APPWINDOW` on the window, which gives the dock a taskbar button while keeping it a Qt tool window, so its frame and geometry don't change. It does not reparent the dock:
 
 - The dock stays in OBS's dock layout, so OBS still saves and restores it as floating, with its geometry and visibility. (OBS saves the layout in its close handler before any plugin event fires. A dock reparented out of the main window would be missing from the saved layout.)
 - Re-docking works as usual, by double-clicking the title bar or dragging the dock back.
@@ -69,11 +69,14 @@ The build compiles against the OBS 31.1.1 headers pinned in `buildspec.json`, th
 5. Do the same with a custom browser dock, and check that it still renders after each step.
 6. Switch Lock UI on and off with a dock popped out, then minimise OBS. The dock stays open.
 7. Minimise OBS to the system tray, if enabled. The dock stays open.
-8. Click the OBS main window while a dock is popped out over it. Note whether the dock now goes behind OBS (see below).
+8. Click the OBS main window while a dock is popped out over it, so the dock goes behind OBS. The dock has its own taskbar entry, and clicking it brings the dock back to the front.
+9. Re-dock the dock. Its taskbar entry disappears.
+10. Check Alt+Tab with a dock popped out, and note whether the dock is listed.
 
 ## Known limitations
 
-- **Z-order.** A floating dock used to stay above OBS's main window because OBS owned it. Without an owner, clicking the main window can bring it in front of the dock. The dock still has no taskbar entry (it is a tool window), so the way back to it is to move OBS, or to toggle the dock off and on in the Docks menu. Whether this needs a fix (for example, giving popped-out docks a taskbar entry) is for the first round of testing to decide.
+- **Z-order.** A floating dock used to stay above OBS's main window because OBS owned it. Without an owner, clicking the main window can bring it in front of the dock. The dock's taskbar entry is the way back to it.
+- **Taskbar grouping.** A popped-out dock belongs to the OBS process, so Windows groups its taskbar entry with OBS's own button (shown as a second window under the OBS icon) unless taskbar buttons are set never to combine.
 - **Title bar theme.** The title bar of a popped-out dock is drawn by Windows and does not follow OBS's dark theme. That is out of scope for this version.
 
 ## License
