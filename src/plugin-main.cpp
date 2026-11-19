@@ -69,6 +69,16 @@ static void frontend_event(enum obs_frontend_event event, void *)
 			dock_break->finishedLoading();
 		break;
 
+	case OBS_FRONTEND_EVENT_THEME_CHANGED:
+		/*
+		 * Raised from OBSApp::StyleChanged, after OBS has applied the new
+		 * palette -- and so after Qt has re-decided every title bar for
+		 * that palette by its own rule.
+		 */
+		if (dock_break)
+			dock_break->themeChanged();
+		break;
+
 	case OBS_FRONTEND_EVENT_EXIT:
 		/*
 		 * The last safe moment to touch the frontend: OBSBasic calls

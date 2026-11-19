@@ -70,6 +70,12 @@ class QMainWindow;
  * never shown owned at all. topLevelChanged() is watched as well, both for the
  * geometry below and to catch any path that does not show the dock.
  *
+ * TITLE BAR
+ *
+ * On Windows the title bar of a floating dock is drawn light or dark to match
+ * OBS's theme (obs_frontend_is_theme_dark), not the Windows colour mode that
+ * Qt goes by. See applyTitleBar().
+ *
  * GEOMETRY
  *
  * While a dock floats, its geometry is remembered under its object name. When
@@ -87,6 +93,9 @@ public:
 	/* OBS_FRONTEND_EVENT_FINISHED_LOADING: OBS has restored its layout. */
 	void finishedLoading();
 
+	/* OBS_FRONTEND_EVENT_THEME_CHANGED: OBS switched theme. */
+	void themeChanged();
+
 	/* OBS_FRONTEND_EVENT_EXIT: last moment the frontend may be touched. */
 	void shutdown();
 
@@ -99,6 +108,8 @@ private:
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
 
 	bool release(QDockWidget *dock);
+	void applyTitleBar(QDockWidget *dock);
+	void scheduleTitleBar(QDockWidget *dock);
 	void rememberGeometry(QDockWidget *dock);
 	void restoreGeometry(QDockWidget *dock);
 

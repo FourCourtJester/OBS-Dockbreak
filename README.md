@@ -18,6 +18,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 - Dragging a dock out of the main window leaves it under the cursor. The saved position is not applied, so the dock is not snatched away mid-drag.
 - If a saved position is no longer on any screen (for example, a monitor was unplugged), the dock is left where Qt puts it.
 - Docks added while OBS is running, such as a new custom browser dock, are handled straight away.
+- On Windows, a popped-out dock's title bar is light or dark to match OBS's theme, and follows it when you change theme.
 - Lock UI is OBS's setting and is left alone.
 
 ## How it works
@@ -29,6 +30,8 @@ Dockbreak clears the transient parent of each floating dock, so the window has n
 - The dock stays in OBS's dock layout, so OBS still saves and restores it as floating, with its geometry and visibility. (OBS saves the layout in its close handler before any plugin event fires. A dock reparented out of the main window would be missing from the saved layout.)
 - Re-docking works as usual, by double-clicking the title bar or dragging the dock back.
 - No native window is destroyed or recreated, so docks that host a browser (CEF) are not re-hosted.
+
+Qt draws a dark title bar only when Windows itself is in dark mode *and* the window's palette is dark, so a dark OBS theme on a light-mode Windows used to get light title bars. Dockbreak sets the dock's title bar from OBS's theme instead (`obs_frontend_is_theme_dark()`, with the same DWM attribute Qt uses). It sets it again when OBS changes theme, and whenever Qt has re-decided it.
 
 The detail is in the comments in [`src/DockBreak.hpp`](src/DockBreak.hpp).
 
@@ -72,12 +75,16 @@ The build compiles against the OBS 31.1.1 headers pinned in `buildspec.json`, th
 8. Click the OBS main window while a dock is popped out over it, so the dock goes behind OBS. The dock has its own taskbar entry, and clicking it brings the dock back to the front.
 9. Re-dock the dock. Its taskbar entry disappears.
 10. Check Alt+Tab with a dock popped out, and note whether the dock is listed.
+11. With a dark OBS theme, pop out a dock. Its title bar is dark, with Windows in light mode and in dark mode.
+12. With a dock popped out, switch OBS between a light and a dark theme (Settings > Appearance). The dock's title bar follows straight away, without being clicked.
+13. With a dock popped out, switch Windows between light and dark mode. The dock's title bar keeps OBS's theme.
 
 ## Known limitations
 
 - **Z-order.** A floating dock used to stay above OBS's main window because OBS owned it. Without an owner, clicking the main window can bring it in front of the dock. The dock's taskbar entry is the way back to it.
 - **Taskbar grouping.** A popped-out dock belongs to the OBS process, so Windows groups its taskbar entry with OBS's own button (shown as a second window under the OBS icon) unless taskbar buttons are set never to combine.
-- **Title bar theme.** The title bar of a popped-out dock is drawn by Windows and does not follow OBS's dark theme. That is out of scope for this version.
+- **Main window title bar.** Dockbreak changes only the docks. OBS's own main window keeps Qt's rule, so with a dark OBS theme on a light-mode Windows, the main window's title bar is light while popped-out docks are dark.
+- **Old Windows 10.** Versions before 1809 have no dark title bars, so docks stay light there.
 
 ## License
 

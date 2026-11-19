@@ -19,6 +19,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "DockBreak.hpp"
 
 #include <obs-module.h>
+#include <obs-frontend-api.h>
 #include <plugin-support.h>
 
 #include <QChildEvent>
@@ -39,6 +40,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dwmapi.h>
 #endif
 
 /* Window moves and resizes arrive in bursts while the operator drags. The file
@@ -49,6 +51,20 @@ static QByteArray dock_name(const QDockWidget *dock)
 {
 	return dock->objectName().toUtf8();
 }
+
+#ifdef _WIN32
+/*
+ * The attribute Qt itself uses for dark title bars
+ * (QWindowsWindow::setDarkBorderToWindow): DWMWA_USE_IMMERSIVE_DARK_MODE is 20
+ * from Windows 10 20H1 on, and was 19 before it. Both are tried, as Qt does.
+ */
+static bool set_dark_title_bar(HWND hwnd, bool dark)
+{
+	const BOOL value = dark ? TRUE : FALSE;
+	return SUCCEEDED(DwmSetWindowAttribute(hwnd, 20, &value, sizeof(value))) ||
+	       SUCCEEDED(DwmSetWindowAttribute(hwnd, 19, &value, sizeof(value)));
+}
+#endif
 
 DockBreak::DockBreak(QMainWindow *main_, const QString &storePath) : main(main_), store(storePath)
 {
@@ -96,6 +112,12 @@ void DockBreak::finishedLoading()
 	}
 }
 
+void DockBreak::themeChanged()
+{
+	for (QDockWidget *dock : std::as_const(tracked))
+		applyTitleBar(dock);
+}
+
 void DockBreak::shutdown()
 {
 	saveTimer.stop();
@@ -134,8 +156,10 @@ void DockBreak::track(QDockWidget *dock)
 
 	connect(dock, &QObject::destroyed, this, [this, dock] { tracked.remove(dock); });
 
-	if (dock->isFloating())
+	if (dock->isFloating()) {
 		release(dock);
+		applyTitleBar(dock);
+	}
 }
 
 bool DockBreak::eventFilter(QObject *watched, QEvent *event)
@@ -155,9 +179,25 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 
 	switch (event->type()) {
 	case QEvent::Show:
-		/* Before show_sys(): the native window never appears owned. */
-		if (dock->isFloating())
+		/* Before show_sys(): the native window never appears owned,
+		 * without a taskbar button, or with the wrong title bar. */
+		if (dock->isFloating()) {
 			release(dock);
+			applyTitleBar(dock);
+		}
+		break;
+
+	case QEvent::ApplicationPaletteChange:
+	case QEvent::PaletteChange:
+	case QEvent::ThemeChange:
+		/*
+		 * Qt decides the title bar again on these, by its own rule
+		 * (QWindowsWindow::windowEvent -> setDarkBorder), which follows
+		 * the Windows colour mode rather than OBS's theme. Ours goes back
+		 * on once Qt has finished.
+		 */
+		if (dock->isFloating())
+			scheduleTitleBar(dock);
 		break;
 
 	case QEvent::Move:
@@ -197,6 +237,7 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 		}
 
 		release(dock);
+		applyTitleBar(dock);
 
 		/*
 		 * Dragging a dock out of the main window floats it under the
@@ -285,6 +326,54 @@ bool DockBreak::release(QDockWidget *dock)
 		obs_log(LOG_INFO, "released floating dock '%s' from the main window", dock_name(dock).constData());
 
 	return changed;
+}
+
+/*
+ * Gives a floating dock the same light or dark title bar as OBS's theme.
+ *
+ * Qt draws a dark title bar only when Windows itself is in dark mode AND the
+ * window's palette is dark (shouldApplyDarkFrame in qwindowswindow.cpp), so a
+ * dark OBS theme on a light-mode Windows gets light title bars. OBS knows
+ * which kind its theme is -- obs_frontend_is_theme_dark() -- and that is what
+ * the dock follows. It is re-applied whenever OBS changes theme
+ * (themeChanged) and whenever Qt has re-decided it (the palette and theme
+ * events in eventFilter).
+ */
+void DockBreak::applyTitleBar(QDockWidget *dock)
+{
+#ifdef _WIN32
+	if (!dock->isFloating())
+		return;
+
+	HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId());
+	if (!hwnd)
+		return;
+
+	if (!set_dark_title_bar(hwnd, obs_frontend_is_theme_dark())) {
+		/* Windows 10 before 1809 has no dark title bars at all. */
+		obs_log(LOG_DEBUG, "could not set the title bar colour of dock '%s'", dock_name(dock).constData());
+		return;
+	}
+
+	/* A window already on screen does not repaint its title bar for the
+	 * attribute alone. A frame change makes it, without moving, resizing,
+	 * activating or restacking anything -- the frame metrics are the same
+	 * in light and dark. */
+	if (IsWindowVisible(hwnd))
+		SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+			     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+				     SWP_NOACTIVATE);
+#else
+	Q_UNUSED(dock);
+#endif
+}
+
+void DockBreak::scheduleTitleBar(QDockWidget *dock)
+{
+	QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+		if (guarded && tracked.contains(guarded.data()))
+			applyTitleBar(guarded);
+	});
 }
 
 void DockBreak::rememberGeometry(QDockWidget *dock)

@@ -41,4 +41,9 @@ target_sources(
   PRIVATE src/plugin-main.cpp src/DockBreak.cpp src/DockBreak.hpp src/GeometryStore.cpp src/GeometryStore.hpp
 )
 
+if(WIN32)
+  # DwmSetWindowAttribute, for title bars that follow OBS's theme.
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE dwmapi)
+endif()
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
