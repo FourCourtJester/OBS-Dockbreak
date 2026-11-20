@@ -106,6 +106,7 @@ private:
 	void sweep();
 	void track(QDockWidget *dock);
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
+	void checkDocked(QPointer<QDockWidget> dock);
 
 	bool release(QDockWidget *dock);
 	void applyTitleBar(QDockWidget *dock);
