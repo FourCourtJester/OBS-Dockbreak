@@ -111,6 +111,10 @@ private:
 	void applyTitleBar(QDockWidget *dock);
 	void scheduleTitleBar(QDockWidget *dock);
 	void rememberGeometry(QDockWidget *dock);
+
+	/* TEMPORARY: Windows test-round diagnostics. */
+	void diag(QDockWidget *dock, const char *what) const;
+	void diagAll(const char *what) const;
 	void restoreGeometry(QDockWidget *dock);
 
 	QPointer<QMainWindow> main;

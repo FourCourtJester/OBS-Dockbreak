@@ -66,6 +66,53 @@ static bool set_dark_title_bar(HWND hwnd, bool dark)
 }
 #endif
 
+/*
+ * TEMPORARY diagnostics for the first round of Windows testing. Each line
+ * records what Qt believes about a dock next to what Windows actually has,
+ * so a log from one test run shows where the two part company. Remove
+ * before release.
+ */
+void DockBreak::diag(QDockWidget *dock, const char *what) const
+{
+	const QRect g = dock->geometry();
+	QWindow *window = dock->windowHandle();
+	const void *tp = window ? static_cast<const void *>(window->transientParent()) : nullptr;
+	const int area = main ? int(main->dockWidgetArea(dock)) : -1;
+
+#ifdef _WIN32
+	HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId());
+	HWND owner = hwnd ? GetWindow(hwnd, GW_OWNER) : nullptr;
+	HWND parent = hwnd ? GetParent(hwnd) : nullptr;
+	const LONG_PTR ex = hwnd ? GetWindowLongPtr(hwnd, GWL_EXSTYLE) : 0;
+	const LONG_PTR st = hwnd ? GetWindowLongPtr(hwnd, GWL_STYLE) : 0;
+	RECT r = {};
+	if (hwnd)
+		GetWindowRect(hwnd, &r);
+
+	obs_log(LOG_INFO,
+		"diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d] "
+		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d rect=%ld,%ld %ldx%ld]",
+		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
+		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height(),
+		static_cast<void *>(hwnd), static_cast<void *>(owner), static_cast<void *>(parent),
+		hwnd ? int(IsWindowVisible(hwnd)) : -1, hwnd ? int(IsIconic(hwnd)) : -1, int((st & WS_CHILD) != 0),
+		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), long(r.left), long(r.top),
+		long(r.right - r.left), long(r.bottom - r.top));
+#else
+	obs_log(LOG_INFO, "diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d]",
+		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
+		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height());
+#endif
+}
+
+void DockBreak::diagAll(const char *what) const
+{
+	for (QDockWidget *dock : std::as_const(tracked)) {
+		if (dock->isFloating() || dock->windowHandle())
+			diag(dock, what);
+	}
+}
+
 DockBreak::DockBreak(QMainWindow *main_, const QString &storePath) : main(main_), store(storePath)
 {
 	store.load();
@@ -110,6 +157,8 @@ void DockBreak::finishedLoading()
 		if (dock->isFloating() && dock->isVisible())
 			rememberGeometry(dock);
 	}
+
+	diagAll("finished-loading");
 }
 
 void DockBreak::themeChanged()
@@ -156,6 +205,8 @@ void DockBreak::track(QDockWidget *dock)
 
 	connect(dock, &QObject::destroyed, this, [this, dock] { tracked.remove(dock); });
 
+	diag(dock, "track");
+
 	if (dock->isFloating()) {
 		release(dock);
 		applyTitleBar(dock);
@@ -170,6 +221,25 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 			if (auto *dock = qobject_cast<QDockWidget *>(child))
 				track(dock);
 		}
+
+		switch (event->type()) {
+		case QEvent::WindowStateChange:
+		case QEvent::Show:
+		case QEvent::Hide: {
+			const char *what = event->type() == QEvent::Show   ? "main-show"
+					   : event->type() == QEvent::Hide ? "main-hide"
+					   : main->isMinimized()           ? "main-minimized"
+									   : "main-state";
+			obs_log(LOG_INFO, "diag %s (spontaneous=%d) main hwnd=%p", what, int(event->spontaneous()),
+				reinterpret_cast<void *>(main->internalWinId()));
+			diagAll(what);
+			/* Again once Windows has finished minimising or restoring. */
+			QTimer::singleShot(500, this, [this, what] { diagAll(what); });
+			break;
+		}
+		default:
+			break;
+		}
 		return false;
 	}
 
@@ -181,10 +251,19 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 	case QEvent::Show:
 		/* Before show_sys(): the native window never appears owned,
 		 * without a taskbar button, or with the wrong title bar. */
+		diag(dock, event->spontaneous() ? "show (spontaneous)" : "show");
 		if (dock->isFloating()) {
 			release(dock);
 			applyTitleBar(dock);
 		}
+		break;
+
+	case QEvent::Hide:
+		diag(dock, event->spontaneous() ? "hide (spontaneous)" : "hide");
+		break;
+
+	case QEvent::WindowStateChange:
+		diag(dock, "window-state");
 		break;
 
 	case QEvent::ApplicationPaletteChange:
@@ -221,9 +300,14 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 	 * as well. Nothing is changed from inside it; the work runs once control
 	 * is back in the event loop.
 	 */
+	if (dock)
+		diag(dock, floating ? "floated (signal)" : "docked (signal)");
+
 	QTimer::singleShot(0, this, [this, dock, floating] {
 		if (!dock || !tracked.contains(dock.data()))
 			return;
+
+		diag(dock, floating ? "floated (deferred)" : "docked (deferred)");
 
 		/* Floated and docked again (or the reverse) before we got here:
 		 * the later signal has its own turn queued. */
@@ -249,6 +333,12 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 		 */
 		if (loaded && dock->isVisible() && QWidget::mouseGrabber() != dock)
 			restoreGeometry(dock);
+
+		diag(dock, "floated (done)");
+		QTimer::singleShot(500, this, [this, dock] {
+			if (dock && tracked.contains(dock.data()))
+				diag(dock, "floated (+500ms)");
+		});
 	});
 }
 
@@ -322,8 +412,10 @@ bool DockBreak::release(QDockWidget *dock)
 	}
 #endif
 
-	if (changed)
+	if (changed) {
 		obs_log(LOG_INFO, "released floating dock '%s' from the main window", dock_name(dock).constData());
+		diag(dock, "released");
+	}
 
 	return changed;
 }
@@ -395,6 +487,9 @@ void DockBreak::restoreGeometry(QDockWidget *dock)
 	/* A monitor may have been unplugged since the position was saved.
 	 * Better to leave the dock where Qt put it than to float it off
 	 * screen, where the operator cannot reach it. */
+	obs_log(LOG_INFO, "diag restore-geometry '%s' -> %d,%d %dx%d", dock_name(dock).constData(), rect.x(), rect.y(),
+		rect.width(), rect.height());
+
 	if (!QGuiApplication::screenAt(rect.center())) {
 		obs_log(LOG_INFO, "saved position of dock '%s' is off screen -- leaving it where it is",
 			dock_name(dock).constData());
