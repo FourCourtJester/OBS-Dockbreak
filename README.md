@@ -19,6 +19,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 - If a saved position is no longer on any screen (for example, a monitor was unplugged), the dock is left where Qt puts it.
 - Docks added while OBS is running, such as a new custom browser dock, are handled straight away.
 - On Windows, a popped-out dock's title bar is light or dark to match OBS's theme, and follows it when you change theme.
+- Repairs OBS's dock layout when a re-docked dock isn't placed. On OBS 33 (Qt 6.11), after a popped-out dock has been moved by its title bar, double-clicking a dock to re-dock it can leave it docked but invisible, and every later re-dock too, until OBS restarts. Dockbreak notices a re-docked dock outside the dock areas and rebuilds the layout the way a restart does. Popped-out docks blink once while it does.
 - Lock UI is OBS's setting and is left alone.
 
 ## How it works

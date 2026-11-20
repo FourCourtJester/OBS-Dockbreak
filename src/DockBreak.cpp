@@ -26,7 +26,6 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QDockWidget>
 #include <QEvent>
 #include <QGuiApplication>
-#include <QLayout>
 #include <QMainWindow>
 #include <QScreen>
 #include <QWindow>
@@ -52,6 +51,9 @@ static constexpr int SAVE_DELAY_MS = 1000;
  * into place (AnimatedDocks) -- before it is checked for having landed outside
  * the main window. */
 static constexpr int DOCK_SETTLE_MS = 500;
+
+/* The shortest gap between two layout repairs. */
+static constexpr int REPAIR_INTERVAL_MS = 2000;
 
 static QByteArray dock_name(const QDockWidget *dock)
 {
@@ -350,51 +352,93 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 }
 
 /*
- * Repairs a dock that Qt re-docked without laying it out.
+ * True for a dock that is docked and visible but not where any dock can be:
+ * outside the main window, or over its central widget (the preview). Docked
+ * docks only ever sit in the dock areas around the central widget.
+ */
+bool DockBreak::misplaced(QDockWidget *dock) const
+{
+	if (!main || dock->isFloating() || !dock->isVisible())
+		return false;
+
+	const QRect g = dock->geometry();
+	if (!main->rect().contains(g))
+		return true;
+
+	QWidget *central = main->centralWidget();
+	return central && central->isVisible() && g.intersects(central->geometry());
+}
+
+/*
+ * Repairs OBS's dock layout after Qt re-docks a dock without laying it out.
  *
- * Double-clicking a floating dock's title bar on Windows sometimes re-docks
- * it into its dock area but leaves it at the position it had while floating,
- * now read as a position inside the main window -- typically far past its
- * right edge. Qt and OBS both consider it docked and visible, so the Docks
- * menu cannot bring it back, and OBS saves that state on exit. It happens
- * without this plugin too. (Seen in OBS 33.0.1 / Qt 6.11.1: the first click
- * of the double-click starts Qt's title-bar drag, and the second re-docks
- * from inside it.)
+ * WHAT GOES WRONG (Qt 6.11.1, OBS 33.0.1, and without this plugin too)
  *
- * A docked, visible dock outside the main window is never a valid layout, so
- * it is safe to test for directly. First the layout is asked to place it; if
- * that is not enough, the dock is taken out of the layout and put back in
- * the same area.
+ * Moving a floating dock by its title bar runs QMainWindowLayout::hover(),
+ * which keeps a copy of the layout (savedState) while it looks for a place
+ * to drop the dock. When the dock is not dropped into a dock area, Qt calls
+ * restore(QInternal::KeepSavedState) -- which leaves that copy in place. And
+ * while it exists, QMainWindowLayout::setGeometry() returns without doing
+ * anything. Dragging a dock back in clears it (hover() over a dock area), so
+ * that still works; re-docking with a double-click does not, so the dock is
+ * docked but never positioned: it keeps its floating coordinates, now read
+ * inside the main window. Every later re-dock fails the same way, and the
+ * Docks menu cannot help, until OBS restarts -- whose restoreState() is one
+ * of the few things that clears the copy.
+ *
+ * THE REPAIR
+ *
+ * Do what the restart does: save the layout and restore it at once. That
+ * clears savedState and lays every dock out in its slot. Any dock that the
+ * saved layout had no slot for is then put back with restoreDockWidget(),
+ * and failing that, removed and re-added to its area. Floating docks are
+ * hidden and shown once by the restore, as at startup, and the Show filter
+ * releases them again.
+ *
+ * Reproduced and checked offscreen against Qt 6.11.1: move one dock by its
+ * title bar, double-click it and a second dock; both stay unplaced until the
+ * repair, after which both are back in the right dock area.
  */
 void DockBreak::checkDocked(QPointer<QDockWidget> dock)
 {
 	QTimer::singleShot(DOCK_SETTLE_MS, this, [this, dock] {
-		if (!dock || !main || !tracked.contains(dock.data()))
+		if (!dock || !main || !tracked.contains(dock.data()) || !misplaced(dock))
 			return;
-		if (dock->isFloating() || !dock->isVisible())
+
+		/* A restore can itself re-dock things; never let repairs chase
+		 * each other. */
+		if (lastRepair.isValid() && lastRepair.elapsed() < REPAIR_INTERVAL_MS)
 			return;
-		if (main->rect().contains(dock->geometry()))
-			return;
+		lastRepair.start();
 
 		const QRect lost = dock->geometry();
-		obs_log(LOG_INFO, "dock '%s' was docked at %d,%d outside the main window (%dx%d) -- placing it again",
-			dock_name(dock).constData(), lost.x(), lost.y(), main->width(), main->height());
+		obs_log(LOG_INFO,
+			"dock '%s' was docked at %d,%d %dx%d, outside its dock area -- rebuilding the dock layout",
+			dock_name(dock).constData(), lost.x(), lost.y(), lost.width(), lost.height());
 
-		if (QLayout *layout = main->layout()) {
-			layout->invalidate();
-			layout->activate();
+		main->restoreState(main->saveState());
+
+		for (QDockWidget *other : std::as_const(tracked)) {
+			if (!misplaced(other))
+				continue;
+
+			if (!main->restoreDockWidget(other) || misplaced(other)) {
+				Qt::DockWidgetArea area = main->dockWidgetArea(other);
+				if (area == Qt::NoDockWidgetArea)
+					area = Qt::RightDockWidgetArea;
+
+				/* addDockWidget() does not drop an existing entry, so
+				 * the dock is removed from the layout first. */
+				main->removeDockWidget(other);
+				main->addDockWidget(area, other);
+				other->show();
+			}
 		}
 
-		if (!main->rect().contains(dock->geometry())) {
-			Qt::DockWidgetArea area = main->dockWidgetArea(dock);
-			if (area == Qt::NoDockWidgetArea)
-				area = Qt::RightDockWidgetArea;
-
-			/* addDockWidget() does not drop an existing entry, so the
-			 * dock is removed from the layout first. */
-			main->removeDockWidget(dock);
-			main->addDockWidget(area, dock);
-			dock->show();
+		for (QDockWidget *other : std::as_const(tracked)) {
+			if (misplaced(other))
+				obs_log(LOG_WARNING, "dock '%s' is still outside its dock area after the repair",
+					dock_name(other).constData());
 		}
 
 		const QRect placed = dock->geometry();

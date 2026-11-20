@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "GeometryStore.hpp"
 
+#include <QElapsedTimer>
 #include <QObject>
 #include <QPointer>
 #include <QSet>
@@ -76,6 +77,14 @@ class QMainWindow;
  * OBS's theme (obs_frontend_is_theme_dark), not the Windows colour mode that
  * Qt goes by. See applyTitleBar().
  *
+ * LAYOUT REPAIR
+ *
+ * Qt 6.11 (OBS 33) can leave OBS's whole dock layout frozen after a floating
+ * dock is moved by its title bar: the next double-click re-dock, and every
+ * one after it, is docked but never positioned. When a re-docked dock lands
+ * outside the dock areas, the layout is rebuilt the way an OBS restart does
+ * it. See checkDocked().
+ *
  * GEOMETRY
  *
  * While a dock floats, its geometry is remembered under its object name. When
@@ -107,6 +116,7 @@ private:
 	void track(QDockWidget *dock);
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
 	void checkDocked(QPointer<QDockWidget> dock);
+	bool misplaced(QDockWidget *dock) const;
 
 	bool release(QDockWidget *dock);
 	void applyTitleBar(QDockWidget *dock);
@@ -126,6 +136,9 @@ private:
 
 	GeometryStore store;
 	QTimer saveTimer;
+
+	/* When the dock layout was last rebuilt (see checkDocked). */
+	QElapsedTimer lastRepair;
 
 	/* False until OBS has restored its saved layout. Until then OBS is the
 	 * authority on where floating docks go, and the plugin only releases
