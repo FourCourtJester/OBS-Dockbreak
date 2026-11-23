@@ -29,6 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QMainWindow>
 #include <QScreen>
 #include <QWindow>
+#include <QWindowStateChangeEvent>
 
 #include <utility>
 
@@ -47,13 +48,18 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  * is written once things settle, and again on exit. */
 static constexpr int SAVE_DELAY_MS = 1000;
 
-/* How long a re-docked dock is given to settle -- QMainWindow animates docks
- * into place (AnimatedDocks) -- before it is checked for having landed outside
- * the main window. */
-static constexpr int DOCK_SETTLE_MS = 500;
+/* How long a re-docked dock is given to settle before it is checked for
+ * having landed outside its dock area. QMainWindow animates docks into place
+ * (AnimatedDocks), for SH_Widget_Animation_Duration -- 200 ms. */
+static constexpr int DOCK_SETTLE_MS = 250;
 
 /* The shortest gap between two layout repairs. */
 static constexpr int REPAIR_INTERVAL_MS = 2000;
+
+/* When OBS minimises, Windows activates the next window in line once the
+ * minimise has run, which can land on top of the docks. They are raised
+ * straight away and again after this long. */
+static constexpr int RAISE_AGAIN_MS = 300;
 
 static QByteArray dock_name(const QDockWidget *dock)
 {
@@ -97,15 +103,35 @@ void DockBreak::diag(QDockWidget *dock, const char *what) const
 	if (hwnd)
 		GetWindowRect(hwnd, &r);
 
+	/* The nearest visible top-level window above this one, and whether it
+	 * belongs to OBS -- which says what would be covering the dock. Only
+	 * the handle is logged, never another program's title. */
+	HWND above = nullptr;
+	bool aboveIsObs = false;
+	if (hwnd && !(st & WS_CHILD)) {
+		for (HWND w = GetWindow(hwnd, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
+			if (IsWindowVisible(w)) {
+				DWORD pid = 0;
+				GetWindowThreadProcessId(w, &pid);
+				above = w;
+				aboveIsObs = pid == GetCurrentProcessId();
+				break;
+			}
+		}
+	}
+	const bool foreground = hwnd && GetForegroundWindow() == hwnd;
+
 	obs_log(LOG_INFO,
 		"diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d] "
-		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d rect=%ld,%ld %ldx%ld]",
+		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d rect=%ld,%ld %ldx%ld "
+		"fg=%d above=%p%s]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
 		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height(),
 		static_cast<void *>(hwnd), static_cast<void *>(owner), static_cast<void *>(parent),
 		hwnd ? int(IsWindowVisible(hwnd)) : -1, hwnd ? int(IsIconic(hwnd)) : -1, int((st & WS_CHILD) != 0),
 		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), long(r.left), long(r.top),
-		long(r.right - r.left), long(r.bottom - r.top));
+		long(r.right - r.left), long(r.bottom - r.top), int(foreground), static_cast<void *>(above),
+		above ? (aboveIsObs ? " (obs)" : " (other)") : "");
 #else
 	obs_log(LOG_INFO, "diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
@@ -230,6 +256,13 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 				track(dock);
 		}
 
+		if (event->type() == QEvent::WindowStateChange) {
+			const bool wasMinimized = static_cast<QWindowStateChangeEvent *>(event)->oldState() &
+						  Qt::WindowMinimized;
+			if (main->isMinimized() != wasMinimized)
+				raiseFloating(main->isMinimized() ? "obs-minimized" : "obs-restored");
+		}
+
 		switch (event->type()) {
 		case QEvent::WindowStateChange:
 		case QEvent::Show:
@@ -349,6 +382,39 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 				diag(dock, "floated (+500ms)");
 		});
 	});
+}
+
+/*
+ * Brings every visible floating dock to the front, without activating it.
+ *
+ * While OBS owned its floating docks, Windows kept them above OBS: they went
+ * away with it and came back with it. Released, a dock is an ordinary window
+ * in the z-order. When OBS minimises, Windows activates the next window in
+ * line -- often whatever is behind OBS -- which then covers the dock; the
+ * dock is still on screen, just buried. And restoring OBS brings only OBS
+ * back to the front.
+ *
+ * So both are done by hand: on minimise, the docks are raised once Windows
+ * has picked the next window; on restore, once OBS is in front again, so they
+ * sit above it as they used to. QWidget::raise() is SetWindowPos(HWND_TOP,
+ * SWP_NOACTIVATE) on Windows (QWindowsBaseWindow::raise_sys): the dock comes
+ * forward without taking focus from whatever has it.
+ */
+void DockBreak::raiseFloating(const char *why)
+{
+	const auto raiseAll = [this](const char *when) {
+		for (QDockWidget *dock : std::as_const(tracked)) {
+			if (dock->isFloating() && dock->isVisible()) {
+				dock->raise();
+				diag(dock, when);
+			}
+		}
+	};
+
+	QTimer::singleShot(0, this, [raiseAll] { raiseAll("raised"); });
+	QTimer::singleShot(RAISE_AGAIN_MS, this, [raiseAll] { raiseAll("raised (again)"); });
+
+	obs_log(LOG_INFO, "%s: bringing floating docks to the front", why);
 }
 
 /*

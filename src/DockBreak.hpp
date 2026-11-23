@@ -117,6 +117,7 @@ private:
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
 	void checkDocked(QPointer<QDockWidget> dock);
 	bool misplaced(QDockWidget *dock) const;
+	void raiseFloating(const char *why);
 
 	bool release(QDockWidget *dock);
 	void applyTitleBar(QDockWidget *dock);

@@ -11,7 +11,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 | State | What Dockbreak does |
 | --- | --- |
 | Dock is in the main window | Nothing. |
-| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open, and gives it a taskbar button. Remembers where it is. |
+| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open and in front, and gives it a taskbar button. Remembers where it is. |
 | Popped-out dock is docked again | Nothing. Its last position is kept, so if it is popped out again (float button, double-click on the title bar, or the Docks menu) it reappears in the same place. |
 
 - A dock that was popped out when OBS closed comes back popped out and independent when OBS starts. OBS restores the layout; Dockbreak releases the dock.
@@ -82,7 +82,7 @@ The build compiles against the OBS 31.1.1 headers pinned in `buildspec.json`, th
 
 ## Known limitations
 
-- **Z-order.** A floating dock used to stay above OBS's main window because OBS owned it. Without an owner, clicking the main window can bring it in front of the dock. The dock's taskbar entry is the way back to it.
+- **Z-order.** A popped-out dock is no longer owned by OBS, so Windows no longer keeps it above OBS by itself. Dockbreak brings popped-out docks to the front, without taking focus, when OBS is minimised and again when it is restored. In between, clicking OBS's main window can still bring OBS in front of a dock; its taskbar entry brings it back.
 - **Taskbar grouping.** A popped-out dock belongs to the OBS process, so Windows groups its taskbar entry with OBS's own button (shown as a second window under the OBS icon) unless taskbar buttons are set never to combine.
 - **Main window title bar.** Dockbreak changes only the docks. OBS's own main window keeps Qt's rule, so with a dark OBS theme on a light-mode Windows, the main window's title bar is light while popped-out docks are dark.
 - **Old Windows 10.** Versions before 1809 have no dark title bars, so docks stay light there.
