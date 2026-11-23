@@ -22,7 +22,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-frontend-api.h>
 #include <plugin-support.h>
 
+#include <QAbstractNativeEventFilter>
 #include <QChildEvent>
+#include <QCoreApplication>
 #include <QDockWidget>
 #include <QEvent>
 #include <QGuiApplication>
@@ -31,6 +33,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QWindow>
 #include <QWindowStateChangeEvent>
 
+#include <memory>
 #include <utility>
 
 #ifdef _WIN32
@@ -192,6 +195,42 @@ void DockBreak::diagAll(const char *what) const
 	}
 }
 
+#ifdef _WIN32
+/*
+ * Takes title-bar double-clicks on floating docks away from Windows.
+ *
+ * Qt passes non-client mouse messages on to DefWindowProc after acting on
+ * them (qwindowspointerhandler.cpp: "Let DefWindowProc() handle Non Client
+ * messages"). For a window with a maximise button, DefWindowProc turns a
+ * caption double-click into a maximise -- at the same moment as QDockWidget
+ * turns it into a re-dock. The message is consumed here, before either sees
+ * it, and the re-dock done by captionDoubleClicked().
+ */
+class CaptionDoubleClickFilter : public QAbstractNativeEventFilter {
+public:
+	explicit CaptionDoubleClickFilter(DockBreak *owner_) : owner(owner_) {}
+
+	bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override
+	{
+		if (eventType != "windows_generic_MSG")
+			return false;
+
+		const MSG *msg = static_cast<const MSG *>(message);
+		if (msg->message != WM_NCLBUTTONDBLCLK || msg->wParam != HTCAPTION)
+			return false;
+
+		if (!owner->captionDoubleClicked(msg->hwnd))
+			return false;
+
+		*result = 0;
+		return true;
+	}
+
+private:
+	DockBreak *owner;
+};
+#endif
+
 DockBreak::DockBreak(QMainWindow *main_, const QString &storePath) : main(main_), store(storePath)
 {
 	store.load();
@@ -213,6 +252,11 @@ DockBreak::DockBreak(QMainWindow *main_, const QString &storePath) : main(main_)
 	 */
 	main->installEventFilter(this);
 	sweep();
+
+#ifdef _WIN32
+	captionFilter = std::make_unique<CaptionDoubleClickFilter>(this);
+	QCoreApplication::instance()->installNativeEventFilter(captionFilter.get());
+#endif
 }
 
 DockBreak::~DockBreak()
@@ -222,6 +266,11 @@ DockBreak::~DockBreak()
 	 * that needs the frontend happens in shutdown(). Writing the file needs
 	 * nothing but the file, and does nothing if shutdown() already did it. */
 	store.save();
+
+#ifdef _WIN32
+	if (captionFilter && QCoreApplication::instance())
+		QCoreApplication::instance()->removeNativeEventFilter(captionFilter.get());
+#endif
 }
 
 void DockBreak::finishedLoading()
@@ -253,6 +302,13 @@ void DockBreak::shutdown()
 
 	if (main)
 		main->removeEventFilter(this);
+
+#ifdef _WIN32
+	if (captionFilter) {
+		QCoreApplication::instance()->removeNativeEventFilter(captionFilter.get());
+		captionFilter.reset();
+	}
+#endif
 
 	for (QDockWidget *dock : std::as_const(tracked)) {
 		dock->removeEventFilter(this);
@@ -375,12 +431,15 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 
 		if (!dock->isVisible()) {
 			/* Qt placing the dock before it is shown: its own choice
-			 * of where the contents go. See giveMinimiseButton(). */
+			 * of where the contents go. See giveTitleBarButtons(). */
 			explicitGeometry.insert(dock);
 			break;
 		}
 
-		if (dock->isMinimized())
+		/* Minimised, maximised or snapped full screen is not where the
+		 * dock lives: neither its frame nor its saved position should
+		 * follow it there. */
+		if (dock->isMinimized() || dock->isMaximized() || dock->isFullScreen())
 			break;
 
 		if (QWindow *window = dock->windowHandle(); window && window->type() == Qt::Window)
@@ -589,13 +648,18 @@ void DockBreak::checkDocked(QPointer<QDockWidget> dock)
 
 #if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
 /*
- * Gives a floating dock a normal title bar, with a minimise button.
+ * Gives a floating dock a normal title bar, with minimise and maximise
+ * buttons.
  *
  * Qt floats a dock as a Qt::Tool window: the slim tool-window title bar,
  * which Windows draws with a close button only, whatever else is asked for.
  * While OBS owned the dock that was fine -- it minimised with OBS. Released,
- * it needs its own. So the dock's QWindow becomes a Qt::Window with
- * WindowMinimizeButtonHint, keeping every other flag. The QWidget is left
+ * it needs its own minimise button. The maximise button is what makes a
+ * window eligible for Windows 11's Snap Layouts (drag to the top of the
+ * screen, or hover the button). So the dock's QWindow becomes a Qt::Window
+ * with WindowMinimizeButtonHint and WindowMaximizeButtonHint, keeping every
+ * other flag. Double-clicking the title bar would now also maximise it,
+ * where QDockWidget re-docks it; captionDoubleClicked() keeps the re-dock. The QWidget is left
  * a Qt::Tool, so QDockWidget's own logic is unaffected; Qt re-applies the
  * widget's flags to the QWindow whenever they change (QWidgetPrivate::create),
  * and every such path ends in show(), where this runs again.
@@ -618,7 +682,7 @@ void DockBreak::checkDocked(QPointer<QDockWidget> dock)
  *    frame -- a Lock UI toggle does this. The contents moved under it; put
  *    them back where they last were while converted (lastClient).
  */
-bool DockBreak::giveMinimiseButton(QDockWidget *dock, QWindow *window)
+bool DockBreak::giveTitleBarButtons(QDockWidget *dock, QWindow *window)
 {
 	if (window->type() == Qt::Window)
 		return false;
@@ -628,7 +692,7 @@ bool DockBreak::giveMinimiseButton(QDockWidget *dock, QWindow *window)
 											     : before;
 
 	const Qt::WindowFlags flags = (window->flags() & ~Qt::WindowType_Mask) | Qt::Window |
-				      Qt::WindowMinimizeButtonHint;
+				      Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint;
 
 	window->setProperty("_q_showWithoutActivating", true);
 	window->setFlags(flags);
@@ -660,7 +724,7 @@ bool DockBreak::release(QDockWidget *dock)
 	}
 
 #if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
-	if (giveMinimiseButton(dock, window))
+	if (giveTitleBarButtons(dock, window))
 		changed = true;
 #endif
 
@@ -770,6 +834,38 @@ void DockBreak::scheduleTitleBar(QDockWidget *dock)
 		if (guarded && tracked.contains(guarded.data()))
 			applyTitleBar(guarded);
 	});
+}
+
+/*
+ * A title-bar double-click on `hwnd`, taken from Windows by
+ * CaptionDoubleClickFilter. Returns true if it was one of our floating docks,
+ * in which case it is re-docked the way QDockWidget would have
+ * (QDockWidgetPrivate::toggleTopLevel: setFloating(!isFloating())).
+ */
+bool DockBreak::captionDoubleClicked(void *hwnd)
+{
+	QDockWidget *dock = nullptr;
+	for (QDockWidget *candidate : std::as_const(tracked)) {
+		if (candidate->isFloating() && reinterpret_cast<void *>(candidate->internalWinId()) == hwnd) {
+			dock = candidate;
+			break;
+		}
+	}
+	if (!dock)
+		return false;
+
+	QTimer::singleShot(0, this, [guarded = QPointer<QDockWidget>(dock)] {
+		if (!guarded || !guarded->isFloating())
+			return;
+
+		/* A maximised dock would otherwise float maximised next time. */
+		const Qt::WindowStates sized = Qt::WindowMaximized | Qt::WindowFullScreen;
+		if (guarded->windowState() & sized)
+			guarded->setWindowState(guarded->windowState() & ~sized);
+
+		guarded->setFloating(false);
+	});
+	return true;
 }
 
 /* A docked dock has no frame of ours: the next float starts afresh. */

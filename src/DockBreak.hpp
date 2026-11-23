@@ -27,6 +27,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSet>
 #include <QTimer>
 
+#include <memory>
+
+class CaptionDoubleClickFilter;
 class QDockWidget;
 class QMainWindow;
 class QWindow;
@@ -51,7 +54,7 @@ class QWindow;
  * a taskbar button (WS_EX_APPWINDOW): an owned window always stays above its
  * owner, an unowned one can end up behind OBS, and a button is the way back to
  * it. It also gives the window a normal title bar with a minimise button
- * (giveMinimiseButton), since nothing minimises an unowned dock otherwise.
+ * (giveTitleBarButtons), since nothing minimises an unowned dock otherwise.
  * Nothing else changes: the dock keeps its QWidget parent, its Qt::Tool
  * widget type and its place in QMainWindow's layout. That matters, because it
  * means:
@@ -121,10 +124,17 @@ private:
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
 	void checkDocked(QPointer<QDockWidget> dock);
 	bool misplaced(QDockWidget *dock) const;
+
+public:
+	/* From CaptionDoubleClickFilter (Windows): a title-bar double-click on
+	 * a native window. True if it was a floating dock, which is re-docked. */
+	bool captionDoubleClicked(void *hwnd);
+
+private:
 	void raiseFloating(const char *why);
 	void forgetFrame(QDockWidget *dock);
 #if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
-	bool giveMinimiseButton(QDockWidget *dock, QWindow *window);
+	bool giveTitleBarButtons(QDockWidget *dock, QWindow *window);
 #endif
 
 	bool release(QDockWidget *dock);
@@ -143,11 +153,15 @@ private:
 	 * is destroyed, so none is ever dereferenced after that. */
 	QSet<QDockWidget *> tracked;
 
-	/* Frame bookkeeping for giveMinimiseButton(), per floating dock: Qt
+	/* Frame bookkeeping for giveTitleBarButtons(), per floating dock: Qt
 	 * placed it since we last converted it; and where its contents last
 	 * were while converted. Both dropped when it docks. */
 	QSet<QDockWidget *> explicitGeometry;
 	QHash<QDockWidget *, QRect> lastClient;
+
+#ifdef _WIN32
+	std::unique_ptr<CaptionDoubleClickFilter> captionFilter;
+#endif
 
 	GeometryStore store;
 	QTimer saveTimer;
