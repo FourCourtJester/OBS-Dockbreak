@@ -68,6 +68,57 @@ static QByteArray dock_name(const QDockWidget *dock)
 
 #ifdef _WIN32
 /*
+ * The nearest window above `hwnd` that actually covers part of it: visible,
+ * not cloaked by DWM (windows on other virtual desktops, suspended apps), not
+ * always-on-top (the taskbar and overlays always sit above everything), and
+ * overlapping its rectangle. Null if nothing covers it.
+ */
+static HWND covering_window(HWND hwnd)
+{
+	if (!hwnd || (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD))
+		return nullptr;
+
+	RECT mine = {};
+	GetWindowRect(hwnd, &mine);
+
+	for (HWND w = GetWindow(hwnd, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
+		if (!IsWindowVisible(w) || IsIconic(w))
+			continue;
+		if (GetWindowLongPtr(w, GWL_EXSTYLE) & WS_EX_TOPMOST)
+			continue;
+
+		DWORD cloaked = 0;
+		if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+			continue;
+
+		RECT theirs = {}, overlap = {};
+		GetWindowRect(w, &theirs);
+		if (IntersectRect(&overlap, &mine, &theirs))
+			return w;
+	}
+	return nullptr;
+}
+
+/*
+ * Puts `hwnd` at the top of the ordinary (not always-on-top) windows, without
+ * activating it.
+ *
+ * SetWindowPos(HWND_TOP), which is what QWidget::raise() does on Windows, is
+ * not enough when OBS is not the foreground program: Windows keeps the
+ * foreground window above it, and a Windows test showed another program's
+ * window still covering the dock after it. Making the window always-on-top
+ * and then not is the usual way round that. HWND_NOTOPMOST is documented to
+ * place the window above all non-topmost windows, and it ends in the same
+ * not-always-on-top state that Qt believes the dock to be in.
+ */
+static void bring_to_front(HWND hwnd)
+{
+	const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+	SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+	SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+}
+
+/*
  * The attribute Qt itself uses for dark title bars
  * (QWindowsWindow::setDarkBorderToWindow): DWMWA_USE_IMMERSIVE_DARK_MODE is 20
  * from Windows 10 20H1 on, and was 19 before it. Both are tried, as Qt does.
@@ -106,18 +157,12 @@ void DockBreak::diag(QDockWidget *dock, const char *what) const
 	/* The nearest visible top-level window above this one, and whether it
 	 * belongs to OBS -- which says what would be covering the dock. Only
 	 * the handle is logged, never another program's title. */
-	HWND above = nullptr;
+	HWND above = covering_window(hwnd);
 	bool aboveIsObs = false;
-	if (hwnd && !(st & WS_CHILD)) {
-		for (HWND w = GetWindow(hwnd, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
-			if (IsWindowVisible(w)) {
-				DWORD pid = 0;
-				GetWindowThreadProcessId(w, &pid);
-				above = w;
-				aboveIsObs = pid == GetCurrentProcessId();
-				break;
-			}
-		}
+	if (above) {
+		DWORD pid = 0;
+		GetWindowThreadProcessId(above, &pid);
+		aboveIsObs = pid == GetCurrentProcessId();
 	}
 	const bool foreground = hwnd && GetForegroundWindow() == hwnd;
 
@@ -396,18 +441,25 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
  *
  * So both are done by hand: on minimise, the docks are raised once Windows
  * has picked the next window; on restore, once OBS is in front again, so they
- * sit above it as they used to. QWidget::raise() is SetWindowPos(HWND_TOP,
- * SWP_NOACTIVATE) on Windows (QWindowsBaseWindow::raise_sys): the dock comes
- * forward without taking focus from whatever has it.
+ * sit above it as they used to. On Windows that is bring_to_front(), which
+ * beats the foreground window where QWidget::raise() does not; either way
+ * the dock comes forward without taking focus from whatever has it.
  */
 void DockBreak::raiseFloating(const char *why)
 {
 	const auto raiseAll = [this](const char *when) {
 		for (QDockWidget *dock : std::as_const(tracked)) {
-			if (dock->isFloating() && dock->isVisible()) {
+			if (!dock->isFloating() || !dock->isVisible())
+				continue;
+#ifdef _WIN32
+			if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId()))
+				bring_to_front(hwnd);
+			else
 				dock->raise();
-				diag(dock, when);
-			}
+#else
+			dock->raise();
+#endif
+			diag(dock, when);
 		}
 	};
 
