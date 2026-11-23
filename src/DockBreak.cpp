@@ -168,15 +168,15 @@ void DockBreak::diag(QDockWidget *dock, const char *what) const
 
 	obs_log(LOG_INFO,
 		"diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d] "
-		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d rect=%ld,%ld %ldx%ld "
+		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d minbox=%d rect=%ld,%ld %ldx%ld "
 		"fg=%d above=%p%s]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
 		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height(),
 		static_cast<void *>(hwnd), static_cast<void *>(owner), static_cast<void *>(parent),
 		hwnd ? int(IsWindowVisible(hwnd)) : -1, hwnd ? int(IsIconic(hwnd)) : -1, int((st & WS_CHILD) != 0),
-		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), long(r.left), long(r.top),
-		long(r.right - r.left), long(r.bottom - r.top), int(foreground), static_cast<void *>(above),
-		above ? (aboveIsObs ? " (obs)" : " (other)") : "");
+		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), int((st & WS_MINIMIZEBOX) != 0),
+		long(r.left), long(r.top), long(r.right - r.left), long(r.bottom - r.top), int(foreground),
+		static_cast<void *>(above), above ? (aboveIsObs ? " (obs)" : " (other)") : "");
 #else
 	obs_log(LOG_INFO, "diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
@@ -282,7 +282,10 @@ void DockBreak::track(QDockWidget *dock)
 	connect(dock, &QDockWidget::topLevelChanged, this,
 		[this, guarded = QPointer<QDockWidget>(dock)](bool floating) { onTopLevelChanged(guarded, floating); });
 
-	connect(dock, &QObject::destroyed, this, [this, dock] { tracked.remove(dock); });
+	connect(dock, &QObject::destroyed, this, [this, dock] {
+		tracked.remove(dock);
+		forgetFrame(dock);
+	});
 
 	diag(dock, "track");
 
@@ -367,7 +370,23 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 
 	case QEvent::Move:
 	case QEvent::Resize:
-		if (loaded && dock->isFloating() && dock->isVisible())
+		if (!dock->isFloating())
+			break;
+
+		if (!dock->isVisible()) {
+			/* Qt placing the dock before it is shown: its own choice
+			 * of where the contents go. See giveMinimiseButton(). */
+			explicitGeometry.insert(dock);
+			break;
+		}
+
+		if (dock->isMinimized())
+			break;
+
+		if (QWindow *window = dock->windowHandle(); window && window->type() == Qt::Window)
+			lastClient.insert(dock, dock->geometry());
+
+		if (loaded)
 			rememberGeometry(dock);
 		break;
 
@@ -403,6 +422,7 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 		if (!floating) {
 			/* Back in the main window. Its saved geometry is kept, so
 			 * the next float puts it back where it was. */
+			forgetFrame(dock);
 			checkDocked(dock);
 			return;
 		}
@@ -449,7 +469,8 @@ void DockBreak::raiseFloating(const char *why)
 {
 	const auto raiseAll = [this](const char *when) {
 		for (QDockWidget *dock : std::as_const(tracked)) {
-			if (!dock->isFloating() || !dock->isVisible())
+			/* A dock the operator minimised stays minimised. */
+			if (!dock->isFloating() || !dock->isVisible() || dock->isMinimized())
 				continue;
 #ifdef _WIN32
 			if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId()))
@@ -566,6 +587,60 @@ void DockBreak::checkDocked(QPointer<QDockWidget> dock)
 	});
 }
 
+#if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
+/*
+ * Gives a floating dock a normal title bar, with a minimise button.
+ *
+ * Qt floats a dock as a Qt::Tool window: the slim tool-window title bar,
+ * which Windows draws with a close button only, whatever else is asked for.
+ * While OBS owned the dock that was fine -- it minimised with OBS. Released,
+ * it needs its own. So the dock's QWindow becomes a Qt::Window with
+ * WindowMinimizeButtonHint, keeping every other flag. The QWidget is left
+ * a Qt::Tool, so QDockWidget's own logic is unaffected; Qt re-applies the
+ * widget's flags to the QWindow whenever they change (QWidgetPrivate::create),
+ * and every such path ends in show(), where this runs again.
+ *
+ * Qt::Tool shows without activating (QWindowsWindow::show_sys); a
+ * Qt::Window would take focus every time it appeared. QWidget sets the same
+ * property for WA_ShowWithoutActivating, so that behaviour is kept.
+ *
+ * THE FRAME
+ *
+ * The two title bars differ in height, and Qt keeps a window's OUTER frame
+ * when its flags change, so the contents shift and resize by the
+ * difference. Left alone, a dock would creep on every swap. Which rectangle
+ * is right depends on who touched the dock last:
+ *
+ *  - Qt has just positioned it -- floated it, restored a layout -- for its
+ *    current, tool-window frame. Its contents are where Qt wants them: keep
+ *    them (explicitGeometry, set by Move/Resize while it is hidden).
+ *  - Qt only swapped our title bar back to the tool one, keeping the outer
+ *    frame -- a Lock UI toggle does this. The contents moved under it; put
+ *    them back where they last were while converted (lastClient).
+ */
+bool DockBreak::giveMinimiseButton(QDockWidget *dock, QWindow *window)
+{
+	if (window->type() == Qt::Window)
+		return false;
+
+	const QRect before = window->geometry();
+	const QRect target = (!explicitGeometry.contains(dock) && lastClient.contains(dock)) ? lastClient.value(dock)
+											     : before;
+
+	const Qt::WindowFlags flags = (window->flags() & ~Qt::WindowType_Mask) | Qt::Window |
+				      Qt::WindowMinimizeButtonHint;
+
+	window->setProperty("_q_showWithoutActivating", true);
+	window->setFlags(flags);
+
+	if (window->geometry() != target)
+		window->setGeometry(target);
+
+	explicitGeometry.remove(dock);
+	return true;
+}
+#endif
+
 /*
  * Makes a floating dock a window of its own: no owner, so minimising OBS
  * leaves it alone, and a taskbar button, so it can be found again once OBS's
@@ -583,6 +658,11 @@ bool DockBreak::release(QDockWidget *dock)
 		window->setTransientParent(nullptr);
 		changed = true;
 	}
+
+#if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
+	if (giveMinimiseButton(dock, window))
+		changed = true;
+#endif
 
 #ifdef _WIN32
 	if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId())) {
@@ -690,6 +770,13 @@ void DockBreak::scheduleTitleBar(QDockWidget *dock)
 		if (guarded && tracked.contains(guarded.data()))
 			applyTitleBar(guarded);
 	});
+}
+
+/* A docked dock has no frame of ours: the next float starts afresh. */
+void DockBreak::forgetFrame(QDockWidget *dock)
+{
+	explicitGeometry.remove(dock);
+	lastClient.remove(dock);
 }
 
 void DockBreak::rememberGeometry(QDockWidget *dock)

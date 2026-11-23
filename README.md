@@ -11,7 +11,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 | State | What Dockbreak does |
 | --- | --- |
 | Dock is in the main window | Nothing. |
-| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open and in front, and gives it a taskbar button. Remembers where it is. |
+| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open and in front. Gives it a normal title bar with a minimise button, and a taskbar button. Remembers where it is. |
 | Popped-out dock is docked again | Nothing. Its last position is kept, so if it is popped out again (float button, double-click on the title bar, or the Docks menu) it reappears in the same place. |
 
 - A dock that was popped out when OBS closed comes back popped out and independent when OBS starts. OBS restores the layout; Dockbreak releases the dock.
@@ -20,6 +20,7 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 - Docks added while OBS is running, such as a new custom browser dock, are handled straight away.
 - On Windows, a popped-out dock's title bar is light or dark to match OBS's theme, and follows it when you change theme.
 - Repairs OBS's dock layout when a re-docked dock isn't placed. On OBS 33 (Qt 6.11), after a popped-out dock has been moved by its title bar, double-clicking a dock to re-dock it can leave it docked but invisible, and every later re-dock too, until OBS restarts. Dockbreak notices a re-docked dock outside the dock areas and rebuilds the layout the way a restart does. Popped-out docks blink once while it does.
+- A dock you minimise stays minimised when OBS is minimised or restored; bring it back from its taskbar entry.
 - Lock UI is OBS's setting and is left alone.
 
 ## How it works

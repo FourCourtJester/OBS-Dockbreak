@@ -21,6 +21,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "GeometryStore.hpp"
 
 #include <QElapsedTimer>
+#include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QSet>
@@ -28,6 +29,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 class QDockWidget;
 class QMainWindow;
+class QWindow;
 
 /*
  * Keeps floating docks on screen when OBS's main window is minimised.
@@ -48,8 +50,10 @@ class QMainWindow;
  * has no owner and the OS leaves it alone. On Windows it also gives the window
  * a taskbar button (WS_EX_APPWINDOW): an owned window always stays above its
  * owner, an unowned one can end up behind OBS, and a button is the way back to
- * it. Nothing else changes: the dock keeps its QWidget parent, its Qt::Tool
- * window type and its place in QMainWindow's layout. That matters, because it
+ * it. It also gives the window a normal title bar with a minimise button
+ * (giveMinimiseButton), since nothing minimises an unowned dock otherwise.
+ * Nothing else changes: the dock keeps its QWidget parent, its Qt::Tool
+ * widget type and its place in QMainWindow's layout. That matters, because it
  * means:
  *
  *  - OBS's own saveState()/restoreState() still records the dock as floating,
@@ -118,6 +122,10 @@ private:
 	void checkDocked(QPointer<QDockWidget> dock);
 	bool misplaced(QDockWidget *dock) const;
 	void raiseFloating(const char *why);
+	void forgetFrame(QDockWidget *dock);
+#if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
+	bool giveMinimiseButton(QDockWidget *dock, QWindow *window);
+#endif
 
 	bool release(QDockWidget *dock);
 	void applyTitleBar(QDockWidget *dock);
@@ -134,6 +142,12 @@ private:
 	/* Raw pointers used only as keys; each entry is removed when its dock
 	 * is destroyed, so none is ever dereferenced after that. */
 	QSet<QDockWidget *> tracked;
+
+	/* Frame bookkeeping for giveMinimiseButton(), per floating dock: Qt
+	 * placed it since we last converted it; and where its contents last
+	 * were while converted. Both dropped when it docks. */
+	QSet<QDockWidget *> explicitGeometry;
+	QHash<QDockWidget *, QRect> lastClient;
 
 	GeometryStore store;
 	QTimer saveTimer;
