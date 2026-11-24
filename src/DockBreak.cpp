@@ -401,6 +401,21 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 		if (dock->isFloating()) {
 			release(dock);
 			applyTitleBar(dock);
+
+			/*
+			 * An owned window always appeared above OBS. Unowned, and
+			 * shown without activating, it appears wherever Windows
+			 * puts it -- a first undock was seen landing under OBS.
+			 * Once it is on screen, bring it forward, as owning it
+			 * used to. A Windows-initiated show (restoring from the
+			 * taskbar) already brings it forward itself.
+			 */
+			if (!event->spontaneous()) {
+				QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+					if (guarded && tracked.contains(guarded.data()))
+						raiseDock(guarded, "raised (shown)");
+				});
+			}
 		}
 		break;
 
@@ -528,26 +543,32 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 void DockBreak::raiseFloating(const char *why)
 {
 	const auto raiseAll = [this](const char *when) {
-		for (QDockWidget *dock : std::as_const(tracked)) {
-			/* A dock the operator minimised stays minimised. */
-			if (!dock->isFloating() || !dock->isVisible() || dock->isMinimized())
-				continue;
-#ifdef _WIN32
-			if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId()))
-				bring_to_front(hwnd);
-			else
-				dock->raise();
-#else
-			dock->raise();
-#endif
-			diag(dock, when);
-		}
+		for (QDockWidget *dock : std::as_const(tracked))
+			raiseDock(dock, when);
 	};
 
 	QTimer::singleShot(0, this, [raiseAll] { raiseAll("raised"); });
 	QTimer::singleShot(RAISE_AGAIN_MS, this, [raiseAll] { raiseAll("raised (again)"); });
 
 	obs_log(LOG_INFO, "%s: bringing floating docks to the front", why);
+}
+
+/* Brings one floating dock to the front, without activating it. */
+void DockBreak::raiseDock(QDockWidget *dock, const char *when)
+{
+	/* A dock the operator minimised stays minimised. */
+	if (!dock->isFloating() || !dock->isVisible() || dock->isMinimized())
+		return;
+
+#ifdef _WIN32
+	if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId()))
+		bring_to_front(hwnd);
+	else
+		dock->raise();
+#else
+	dock->raise();
+#endif
+	diag(dock, when);
 }
 
 /*

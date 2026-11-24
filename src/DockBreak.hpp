@@ -132,6 +132,7 @@ public:
 
 private:
 	void raiseFloating(const char *why);
+	void raiseDock(QDockWidget *dock, const char *when);
 	void forgetFrame(QDockWidget *dock);
 #if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
 	bool giveTitleBarButtons(QDockWidget *dock, QWindow *window);
