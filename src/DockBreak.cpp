@@ -223,7 +223,19 @@ public:
 		if (!owner->captionDoubleClicked(msg->hwnd))
 			return false;
 
-		*result = 0;
+		/*
+		 * Qt runs native event filters from two places on Windows, and
+		 * only one has a result to give. The event dispatcher filters
+		 * every queued message before dispatching it, with a NULL result
+		 * (QEventDispatcherWin32::processEvents: filterNativeEvent(...,
+		 * &msg, 0)); returning true there means the message is never
+		 * translated or dispatched at all. The window procedure filters
+		 * again with a real LRESULT. A double-click is a queued message,
+		 * so it arrives through the dispatcher first. Writing through
+		 * that NULL is what crashed OBS on every title-bar double-click.
+		 */
+		if (result)
+			*result = 0;
 		return true;
 	}
 
