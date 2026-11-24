@@ -41,6 +41,24 @@ target_sources(
   PRIVATE src/plugin-main.cpp src/DockBreak.cpp src/DockBreak.hpp src/GeometryStore.cpp src/GeometryStore.hpp
 )
 
+# The commit being built, logged at load. CI artifact names end in the same
+# nine characters, so a log can be matched to the download it came from.
+set(_build_id "")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse --short=9 HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE _build_id
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+endif()
+if(NOT _build_id)
+  set(_build_id "unknown")
+endif()
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE DOCKBREAK_BUILD_ID="${_build_id}")
+
 if(WIN32)
   # DwmSetWindowAttribute, for title bars that follow OBS's theme.
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE dwmapi)

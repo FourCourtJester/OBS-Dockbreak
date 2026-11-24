@@ -171,15 +171,16 @@ void DockBreak::diag(QDockWidget *dock, const char *what) const
 
 	obs_log(LOG_INFO,
 		"diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d] "
-		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d minbox=%d rect=%ld,%ld %ldx%ld "
+		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d minbox=%d maxbox=%d rect=%ld,%ld %ldx%ld "
 		"fg=%d above=%p%s]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
 		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height(),
 		static_cast<void *>(hwnd), static_cast<void *>(owner), static_cast<void *>(parent),
 		hwnd ? int(IsWindowVisible(hwnd)) : -1, hwnd ? int(IsIconic(hwnd)) : -1, int((st & WS_CHILD) != 0),
 		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), int((st & WS_MINIMIZEBOX) != 0),
-		long(r.left), long(r.top), long(r.right - r.left), long(r.bottom - r.top), int(foreground),
-		static_cast<void *>(above), above ? (aboveIsObs ? " (obs)" : " (other)") : "");
+		int((st & WS_MAXIMIZEBOX) != 0), long(r.left), long(r.top), long(r.right - r.left),
+		long(r.bottom - r.top), int(foreground), static_cast<void *>(above),
+		above ? (aboveIsObs ? " (obs)" : " (other)") : "");
 #else
 	obs_log(LOG_INFO, "diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),

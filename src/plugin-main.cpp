@@ -27,6 +27,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+/* Set by CMake: the commit built, matching the CI artifact's name. */
+#ifndef DOCKBREAK_BUILD_ID
+#define DOCKBREAK_BUILD_ID "unknown"
+#endif
+
 /*
  * 32.0.0 is the first release with the plugin manager, which is the floor this
  * plugin is supported on.
@@ -120,7 +125,7 @@ bool obs_module_load(void)
 	obs_frontend_add_event_callback(frontend_event, nullptr);
 	callback_registered = true;
 
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+	obs_log(LOG_INFO, "plugin loaded successfully (version %s, build %s)", PLUGIN_VERSION, DOCKBREAK_BUILD_ID);
 	return true;
 }
 
