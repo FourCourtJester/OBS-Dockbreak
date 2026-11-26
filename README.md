@@ -28,11 +28,18 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 
 A floating `QDockWidget` is a top-level window whose Qt parent is still the main window. Qt gives it the main window as its *transient parent*. On Windows that becomes the native **owner** of the window, and Windows hides owned windows when their owner is minimised. Qt itself does not hide it.
 
-Dockbreak clears the transient parent of each floating dock, so the window has no owner. It also sets `WS_EX_APPWINDOW` on the window, which gives the dock a taskbar button while keeping it a Qt tool window, so its frame and geometry don't change. It does not reparent the dock:
+Dockbreak clears the transient parent of each floating dock, so the window has no owner. It does not reparent the dock:
 
 - The dock stays in OBS's dock layout, so OBS still saves and restores it as floating, with its geometry and visibility. (OBS saves the layout in its close handler before any plugin event fires. A dock reparented out of the main window would be missing from the saved layout.)
 - Re-docking works as usual, by double-clicking the title bar or dragging the dock back.
 - No native window is destroyed or recreated, so docks that host a browser (CEF) are not re-hosted.
+
+Without an owner, the dock also needs what owning it used to give it. Dockbreak:
+
+- gives it a taskbar button (`WS_EX_APPWINDOW`);
+- swaps Qt's slim tool-window title bar, which Windows draws with a close button only, for a normal one with minimise and maximise buttons, keeping the dock's contents exactly where they were;
+- brings it to the front, without taking focus, when it pops out and when OBS is minimised or restored, since Windows no longer keeps it above OBS;
+- takes title-bar double-clicks away from Windows, so they re-dock the dock instead of maximising it.
 
 Qt draws a dark title bar only when Windows itself is in dark mode *and* the window's palette is dark, so a dark OBS theme on a light-mode Windows used to get light title bars. Dockbreak sets the dock's title bar from OBS's theme instead (`obs_frontend_is_theme_dark()`, with the same DWM attribute Qt uses). It sets it again when OBS changes theme, and whenever Qt has re-decided it.
 
@@ -50,8 +57,17 @@ The file is disposable. If you delete it, the only effect is that a dock maximis
 
 ## Requirements
 
-- **OBS Studio 32.0.0 or later.** The plugin checks the running OBS version and refuses to load on anything older.
+- **OBS Studio 32.0.0 or later.** The plugin checks the running OBS version and refuses to load on anything older. Tested on OBS 33.0.1.
 - **Windows.** Linux and macOS are not supported yet.
+
+## Installing
+
+1. Download the Windows build: on GitHub, open the latest successful run under **Actions** and download `obs-dockbreak-<version>-windows-x64-<build>` from its **Artifacts**. You need to be signed in to GitHub.
+2. Close OBS.
+3. Unzip the download, then unzip the zip inside it. Copy the `obs-dockbreak` folder into `C:\ProgramData\obs-studio\plugins\` (create `plugins` if it doesn't exist), so that you have `C:\ProgramData\obs-studio\plugins\obs-dockbreak\bin\64bit\obs-dockbreak.dll`.
+4. Start OBS. Help > Log Files > View Current Log should contain `[obs-dockbreak] plugin loaded successfully (version <version>, build <build>)`, with the same build as the download's name.
+
+To uninstall, delete that `obs-dockbreak` folder. On OBS 33, the plugin manager marks this folder layout as "Legacy"; it still loads.
 
 ## Building
 
@@ -68,26 +84,43 @@ The build compiles against the OBS 31.1.1 headers pinned in `buildspec.json`, th
 
 ## Manual test (Windows)
 
-1. Pop out a dock. Minimise OBS. The dock stays on screen.
-2. Restore OBS and dock the dock again. It goes back into the main window.
-3. Reshape it, dock it, and pop it out again with the float button. It starts from its docked size, where it was docked, not the shape you gave it.
-4. Restart OBS with the dock popped out. It comes back popped out, and stays open when OBS is minimised.
-5. Do the same with a custom browser dock, and check that it still renders after each step.
-6. Switch Lock UI on and off with a dock popped out, then minimise OBS. The dock stays open.
-7. Minimise OBS to the system tray, if enabled. The dock stays open.
-8. Click the OBS main window while a dock is popped out over it, so the dock goes behind OBS. The dock has its own taskbar entry, and clicking it brings the dock back to the front.
-9. Re-dock the dock. Its taskbar entry disappears.
-10. Check Alt+Tab with a dock popped out, and note whether the dock is listed.
-11. With a dark OBS theme, pop out a dock. Its title bar is dark, with Windows in light mode and in dark mode.
-12. With a dock popped out, switch OBS between a light and a dark theme (Settings > Appearance). The dock's title bar follows straight away, without being clicked.
-13. With a dock popped out, switch Windows between light and dark mode. The dock's title bar keeps OBS's theme.
+Use a custom browser dock for at least one round, and check that it keeps rendering throughout.
+
+**Staying open**
+
+1. Pop out a dock. Minimise OBS. The dock stays on screen and in front.
+2. Restore OBS. The dock is in front of OBS.
+3. Minimise OBS to the system tray, if enabled. The dock stays open.
+4. Switch Lock UI on and off with a dock popped out, then minimise OBS. The dock stays open.
+
+**Popping out and re-docking**
+
+5. Pop out a dock, by dragging it out and by the float button. It appears in front of OBS. A second or two later, clicking OBS brings OBS in front of it.
+6. Double-click a popped-out dock's title bar. It re-docks.
+7. Move a popped-out dock by its title bar, then double-click it, and then double-click a second dock. Both re-dock into place (within about a second).
+8. Reshape a popped-out dock, re-dock it and pop it out again. It starts at its docked size, where it was docked.
+
+**Title bar and window**
+
+9. A popped-out dock has minimise, maximise and close buttons and a taskbar entry; re-docked, the entry disappears.
+10. Minimise the dock itself, then minimise and restore OBS. The dock stays minimised until you bring it back from its taskbar entry.
+11. Drag a popped-out dock to the top of the screen. Windows' snap bar appears. Snap it, re-dock it, pop it out again: it starts at its docked size.
+12. Maximise a popped-out dock, double-click its title bar: it re-docks, and pops out again at its docked size, not maximised.
+13. Restart OBS with a dock maximised. It comes back maximised, and its restore button shrinks it.
+14. Restart OBS with a dock popped out. It comes back popped out, at the same size, and stays open when OBS is minimised.
+
+**Theme**
+
+15. With a dark OBS theme, a popped-out dock's title bar is dark, with Windows in light mode and in dark mode.
+16. Switch OBS between a light and a dark theme (Settings > Appearance). The dock's title bar follows straight away.
 
 ## Known limitations
 
-- **Z-order.** A popped-out dock is no longer owned by OBS, so Windows no longer keeps it above OBS by itself. Dockbreak brings popped-out docks to the front, without taking focus, when OBS is minimised and again when it is restored. In between, clicking OBS's main window can still bring OBS in front of a dock; its taskbar entry brings it back.
+- **Z-order.** A popped-out dock is no longer owned by OBS, so Windows no longer keeps it above OBS by itself. Dockbreak brings it to the front when it pops out and when OBS is minimised or restored. Otherwise OBS and the dock stack like any two windows; the dock's taskbar entry brings it back.
 - **Taskbar grouping.** A popped-out dock belongs to the OBS process, so Windows groups its taskbar entry with OBS's own button (shown as a second window under the OBS icon) unless taskbar buttons are set never to combine.
 - **Main window title bar.** Dockbreak changes only the docks. OBS's own main window keeps Qt's rule, so with a dark OBS theme on a light-mode Windows, the main window's title bar is light while popped-out docks are dark.
 - **Old Windows 10.** Versions before 1809 have no dark title bars, so docks stay light there.
+- **Not Dockbreak's:** on OBS 33, a docked dock closed with its X button can come back on the next start; closing it from the Docks menu doesn't. This happens without Dockbreak too.
 
 ## License
 

@@ -81,38 +81,6 @@ static QByteArray dock_name(const QDockWidget *dock)
 
 #ifdef _WIN32
 /*
- * The nearest window above `hwnd` that actually covers part of it: visible,
- * not cloaked by DWM (windows on other virtual desktops, suspended apps), not
- * always-on-top (the taskbar and overlays always sit above everything), and
- * overlapping its rectangle. Null if nothing covers it.
- */
-static HWND covering_window(HWND hwnd)
-{
-	if (!hwnd || (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CHILD))
-		return nullptr;
-
-	RECT mine = {};
-	GetWindowRect(hwnd, &mine);
-
-	for (HWND w = GetWindow(hwnd, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV)) {
-		if (!IsWindowVisible(w) || IsIconic(w))
-			continue;
-		if (GetWindowLongPtr(w, GWL_EXSTYLE) & WS_EX_TOPMOST)
-			continue;
-
-		DWORD cloaked = 0;
-		if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
-			continue;
-
-		RECT theirs = {}, overlap = {};
-		GetWindowRect(w, &theirs);
-		if (IntersectRect(&overlap, &mine, &theirs))
-			return w;
-	}
-	return nullptr;
-}
-
-/*
  * Puts `hwnd` at the top of the ordinary (not always-on-top) windows, without
  * activating it.
  *
@@ -159,68 +127,6 @@ static bool set_dark_title_bar(HWND hwnd, bool dark)
 	       SUCCEEDED(DwmSetWindowAttribute(hwnd, 19, &value, sizeof(value)));
 }
 #endif
-
-/*
- * TEMPORARY diagnostics for the first round of Windows testing. Each line
- * records what Qt believes about a dock next to what Windows actually has,
- * so a log from one test run shows where the two part company. Remove
- * before release.
- */
-void DockBreak::diag(QDockWidget *dock, const char *what) const
-{
-	const QRect g = dock->geometry();
-	QWindow *window = dock->windowHandle();
-	const void *tp = window ? static_cast<const void *>(window->transientParent()) : nullptr;
-	const int area = main ? int(main->dockWidgetArea(dock)) : -1;
-
-#ifdef _WIN32
-	HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId());
-	HWND owner = hwnd ? GetWindow(hwnd, GW_OWNER) : nullptr;
-	HWND parent = hwnd ? GetParent(hwnd) : nullptr;
-	const LONG_PTR ex = hwnd ? GetWindowLongPtr(hwnd, GWL_EXSTYLE) : 0;
-	const LONG_PTR st = hwnd ? GetWindowLongPtr(hwnd, GWL_STYLE) : 0;
-	RECT r = {};
-	if (hwnd)
-		GetWindowRect(hwnd, &r);
-
-	/* The nearest visible top-level window above this one, and whether it
-	 * belongs to OBS -- which says what would be covering the dock. Only
-	 * the handle is logged, never another program's title. */
-	HWND above = covering_window(hwnd);
-	bool aboveIsObs = false;
-	if (above) {
-		DWORD pid = 0;
-		GetWindowThreadProcessId(above, &pid);
-		aboveIsObs = pid == GetCurrentProcessId();
-	}
-	const bool foreground = hwnd && GetForegroundWindow() == hwnd;
-
-	obs_log(LOG_INFO,
-		"diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d] "
-		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d minbox=%d maxbox=%d snapped=%d rect=%ld,%ld %ldx%ld "
-		"fg=%d above=%p%s]",
-		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
-		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height(),
-		static_cast<void *>(hwnd), static_cast<void *>(owner), static_cast<void *>(parent),
-		hwnd ? int(IsWindowVisible(hwnd)) : -1, hwnd ? int(IsIconic(hwnd)) : -1, int((st & WS_CHILD) != 0),
-		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), int((st & WS_MINIMIZEBOX) != 0),
-		int((st & WS_MAXIMIZEBOX) != 0), int(is_snapped(hwnd)), long(r.left), long(r.top),
-		long(r.right - r.left), long(r.bottom - r.top), int(foreground), static_cast<void *>(above),
-		above ? (aboveIsObs ? " (obs)" : " (other)") : "");
-#else
-	obs_log(LOG_INFO, "diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d]",
-		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
-		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height());
-#endif
-}
-
-void DockBreak::diagAll(const char *what) const
-{
-	for (QDockWidget *dock : std::as_const(tracked)) {
-		if (dock->isFloating() || dock->windowHandle())
-			diag(dock, what);
-	}
-}
 
 #ifdef _WIN32
 /*
@@ -346,8 +252,6 @@ void DockBreak::finishedLoading()
 	/* Only now: until here OBS is still placing docks from its layout,
 	 * and its placements are not recorded (see eventFilter). */
 	loaded = true;
-
-	diagAll("finished-loading");
 }
 
 void DockBreak::themeChanged()
@@ -405,8 +309,6 @@ void DockBreak::track(QDockWidget *dock)
 		forgetFrame(dock);
 	});
 
-	diag(dock, "track");
-
 	if (dock->isFloating()) {
 		release(dock);
 		applyTitleBar(dock);
@@ -429,13 +331,6 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 				raiseFloating(main->isMinimized() ? "obs-minimized" : "obs-restored");
 		}
 
-		/*
-		 * Popping a dock out is a click in OBS, and OBS becoming active
-		 * puts it above the unowned dock that just appeared. So for a
-		 * moment after a pop-out, OBS's activation puts the docks back in
-		 * front. Only for a moment: after that, clicking OBS is the
-		 * operator bringing OBS forward, over a maximised dock too.
-		 */
 		/* Docks laid out while OBS was still hidden become visible with
 		 * it, without moving: note where they sit. */
 		if (event->type() == QEvent::Show) {
@@ -445,28 +340,17 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 			});
 		}
 
+		/*
+		 * Popping a dock out is a click in OBS, and OBS becoming active
+		 * puts it above the unowned dock that just appeared. So for a
+		 * moment after a pop-out, OBS's activation puts the docks back in
+		 * front. Only for a moment: after that, clicking OBS is the
+		 * operator bringing OBS forward, over a maximised dock too.
+		 */
 		if (event->type() == QEvent::WindowActivate && keepInFront.isValid() &&
 		    keepInFront.elapsed() < KEEP_IN_FRONT_MS)
 			raiseFloating("obs-activated after a pop-out");
 
-		switch (event->type()) {
-		case QEvent::WindowStateChange:
-		case QEvent::Show:
-		case QEvent::Hide: {
-			const char *what = event->type() == QEvent::Show   ? "main-show"
-					   : event->type() == QEvent::Hide ? "main-hide"
-					   : main->isMinimized()           ? "main-minimized"
-									   : "main-state";
-			obs_log(LOG_INFO, "diag %s (spontaneous=%d) main hwnd=%p", what, int(event->spontaneous()),
-				reinterpret_cast<void *>(main->internalWinId()));
-			diagAll(what);
-			/* Again once Windows has finished minimising or restoring. */
-			QTimer::singleShot(500, this, [this, what] { diagAll(what); });
-			break;
-		}
-		default:
-			break;
-		}
 		return false;
 	}
 
@@ -478,7 +362,6 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 	case QEvent::Show:
 		/* Before show_sys(): the native window never appears owned,
 		 * without a taskbar button, or with the wrong title bar. */
-		diag(dock, event->spontaneous() ? "show (spontaneous)" : "show");
 		if (!dock->isFloating()) {
 			/* After the show, once the layout has placed it. */
 			QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
@@ -503,19 +386,14 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 				for (const int delay : {0, RAISE_AGAIN_MS}) {
 					QTimer::singleShot(delay, this, [this, guarded = QPointer<QDockWidget>(dock)] {
 						if (guarded && tracked.contains(guarded.data()))
-							raiseDock(guarded, "raised (shown)");
+							raiseDock(guarded);
 					});
 				}
 			}
 		}
 		break;
 
-	case QEvent::Hide:
-		diag(dock, event->spontaneous() ? "hide (spontaneous)" : "hide");
-		break;
-
 	case QEvent::WindowStateChange:
-		diag(dock, "window-state");
 		/* Remembered so a dock maximised when OBS closes comes back
 		 * maximised (finishedLoading). Not before OBS has finished
 		 * restoring its layout, which is what is being remembered. */
@@ -568,14 +446,9 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 	 * as well. Nothing is changed from inside it; the work runs once control
 	 * is back in the event loop.
 	 */
-	if (dock)
-		diag(dock, floating ? "floated (signal)" : "docked (signal)");
-
 	QTimer::singleShot(0, this, [this, dock, floating] {
 		if (!dock || !tracked.contains(dock.data()))
 			return;
-
-		diag(dock, floating ? "floated (deferred)" : "docked (deferred)");
 
 		/* Floated and docked again (or the reverse) before we got here:
 		 * the later signal has its own turn queued. */
@@ -610,12 +483,6 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 		 */
 		if (loaded && !repairing && dock->isVisible() && QWidget::mouseGrabber() != dock)
 			placeAtDefault(dock);
-
-		diag(dock, "floated (done)");
-		QTimer::singleShot(500, this, [this, dock] {
-			if (dock && tracked.contains(dock.data()))
-				diag(dock, "floated (+500ms)");
-		});
 	});
 }
 
@@ -637,19 +504,19 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
  */
 void DockBreak::raiseFloating(const char *why)
 {
-	const auto raiseAll = [this](const char *when) {
+	const auto raiseAll = [this] {
 		for (QDockWidget *dock : std::as_const(tracked))
-			raiseDock(dock, when);
+			raiseDock(dock);
 	};
 
-	QTimer::singleShot(0, this, [raiseAll] { raiseAll("raised"); });
-	QTimer::singleShot(RAISE_AGAIN_MS, this, [raiseAll] { raiseAll("raised (again)"); });
+	QTimer::singleShot(0, this, raiseAll);
+	QTimer::singleShot(RAISE_AGAIN_MS, this, raiseAll);
 
-	obs_log(LOG_INFO, "%s: bringing floating docks to the front", why);
+	obs_log(LOG_DEBUG, "%s: bringing floating docks to the front", why);
 }
 
 /* Brings one floating dock to the front, without activating it. */
-void DockBreak::raiseDock(QDockWidget *dock, const char *when)
+void DockBreak::raiseDock(QDockWidget *dock)
 {
 	/* A dock the operator minimised stays minimised. */
 	if (!dock->isFloating() || !dock->isVisible() || dock->isMinimized())
@@ -663,7 +530,6 @@ void DockBreak::raiseDock(QDockWidget *dock, const char *when)
 #else
 	dock->raise();
 #endif
-	diag(dock, when);
 }
 
 /*
@@ -761,7 +627,6 @@ void DockBreak::checkDocked(QPointer<QDockWidget> dock)
 		const QRect placed = dock->geometry();
 		obs_log(LOG_INFO, "dock '%s' is now at %d,%d %dx%d", dock_name(dock).constData(), placed.x(),
 			placed.y(), placed.width(), placed.height());
-		diag(dock, "re-docked (repaired)");
 	});
 }
 
@@ -900,8 +765,7 @@ bool DockBreak::release(QDockWidget *dock)
 #endif
 
 	if (changed) {
-		obs_log(LOG_INFO, "released floating dock '%s' from the main window", dock_name(dock).constData());
-		diag(dock, "released");
+		obs_log(LOG_DEBUG, "released floating dock '%s' from the main window", dock_name(dock).constData());
 	}
 
 	return changed;

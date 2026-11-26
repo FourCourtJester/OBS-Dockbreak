@@ -135,7 +135,7 @@ public:
 
 private:
 	void raiseFloating(const char *why);
-	void raiseDock(QDockWidget *dock, const char *when);
+	void raiseDock(QDockWidget *dock);
 	void forgetFrame(QDockWidget *dock);
 #if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
 	bool giveTitleBarButtons(QDockWidget *dock, QWindow *window);
@@ -146,9 +146,6 @@ private:
 	void scheduleTitleBar(QDockWidget *dock);
 	void rememberGeometry(QDockWidget *dock);
 
-	/* TEMPORARY: Windows test-round diagnostics. */
-	void diag(QDockWidget *dock, const char *what) const;
-	void diagAll(const char *what) const;
 	void placeAtDefault(QDockWidget *dock);
 	void noteDocked(QDockWidget *dock);
 
