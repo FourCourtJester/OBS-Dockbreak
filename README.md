@@ -68,7 +68,7 @@ The file is disposable. If you delete it, the only effect is that a dock maximis
 
 ## Installing
 
-Download `obs-dockbreak-<version>-windows-x64.zip` from the [latest release](https://github.com/FourCourtJester/OBS-Dockbreak/releases). For a build of an unreleased branch, use the Artifacts of a [CI run](https://github.com/FourCourtJester/OBS-Dockbreak/actions) instead (you need to be signed in to GitHub; the artifact is a zip with the plugin's zip inside).
+Download `obs-dockbreak-<version>-windows-x64.zip` from the [latest release](https://github.com/FourCourtJester/OBS-Plugin-Dockbreak/releases). For a build of an unreleased branch, use the Artifacts of a [CI run](https://github.com/FourCourtJester/OBS-Plugin-Dockbreak/actions) instead (you need to be signed in to GitHub; the artifact is a zip with the plugin's zip inside).
 
 **Close OBS before copying anything in.** The plugin is loaded at startup, and a running OBS holds the file open.
 
