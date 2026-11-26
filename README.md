@@ -2,9 +2,15 @@
 
 An OBS Studio plugin that keeps popped-out docks open when the OBS main window is minimised.
 
-When a dock is popped out (floating) in OBS, Windows still treats it as belonging to the main window and hides it whenever the main window is minimised. With Dockbreak, any dock you pop out stays on screen until you close it or dock it again.
+## The problem
 
-The plugin applies to every dock, whether it comes from OBS, another plugin, or a custom browser dock. It has no settings.
+A dock you pop out of OBS still belongs to OBS's main window as far as Windows is concerned. Minimise OBS and every popped-out dock disappears with it, and it has no taskbar entry, minimise button or snapping of its own. That rules out the obvious setup for a control panel such as a browser dock: keep the panel up and OBS out of the way.
+
+## What it does
+
+Every dock you pop out becomes a window of its own. It stays on screen when OBS is minimised, gets its own taskbar entry, minimise and maximise buttons (so Windows 11 Snap Layouts work) and a title bar that matches OBS's theme. Docked docks are left alone.
+
+It applies to every dock, whether it comes from OBS, another plugin, or a custom browser dock. It has no settings.
 
 ## Behaviour
 
@@ -62,12 +68,50 @@ The file is disposable. If you delete it, the only effect is that a dock maximis
 
 ## Installing
 
-1. Download the Windows build: on GitHub, open the latest successful run under **Actions** and download `obs-dockbreak-<version>-windows-x64-<build>` from its **Artifacts**. You need to be signed in to GitHub.
-2. Close OBS.
-3. Unzip the download, then unzip the zip inside it. Copy the `obs-dockbreak` folder into `C:\ProgramData\obs-studio\plugins\` (create `plugins` if it doesn't exist), so that you have `C:\ProgramData\obs-studio\plugins\obs-dockbreak\bin\64bit\obs-dockbreak.dll`.
-4. Start OBS. Help > Log Files > View Current Log should contain `[obs-dockbreak] plugin loaded successfully (version <version>, build <build>)`, with the same build as the download's name.
+Download `obs-dockbreak-<version>-windows-x64.zip` from the [latest release](https://github.com/FourCourtJester/OBS-Dockbreak/releases). For a build of an unreleased branch, use the Artifacts of a [CI run](https://github.com/FourCourtJester/OBS-Dockbreak/actions) instead (you need to be signed in to GitHub; the artifact is a zip with the plugin's zip inside).
 
-To uninstall, delete that `obs-dockbreak` folder. On OBS 33, the plugin manager marks this folder layout as "Legacy"; it still loads.
+**Close OBS before copying anything in.** The plugin is loaded at startup, and a running OBS holds the file open.
+
+The zip contains an `obs-dockbreak` folder already in the right shape. Drop it whole into:
+
+```
+C:\ProgramData\obs-studio\plugins\
+```
+
+so that you end up with:
+
+```
+C:\ProgramData\obs-studio\plugins\obs-dockbreak\bin\64bit\obs-dockbreak.dll
+C:\ProgramData\obs-studio\plugins\obs-dockbreak\data\locale\en-US.ini
+```
+
+Paste `%ProgramData%\obs-studio\plugins` into the Explorer address bar to get there, and create the `plugins` folder if it isn't there. No admin rights are needed, and OBS updates leave it alone.
+
+**It is not `%APPDATA%`.** Many guides say it is, but `%APPDATA%\obs-studio` holds your settings, not plugins. OBS looks in `C:\ProgramData`.
+
+Two cases where that folder is wrong:
+
+- **Portable mode.** A portable OBS never looks in `C:\ProgramData`. Install next to OBS instead (below), in the portable folder.
+- **Installing next to OBS itself.** This works too, but the files are split rather than kept in one folder, and it needs admin rights for `Program Files`:
+
+  ```
+  C:\Program Files\obs-studio\obs-plugins\64bit\obs-dockbreak.dll
+  C:\Program Files\obs-studio\data\obs-plugins\obs-dockbreak\locale\en-US.ini
+  ```
+
+On OBS 33 the plugin manager marks the `C:\ProgramData` folder layout as "Legacy". It still loads normally.
+
+To uninstall, close OBS and delete the `obs-dockbreak` folder (or, if you installed next to OBS, the two files above).
+
+### Checking it loaded
+
+Start OBS and open the log (Help > Log Files > View Current Log), then search for `obs-dockbreak`. A successful load logs:
+
+```
+[obs-dockbreak] plugin loaded successfully (version 1.0.0, build <build>)
+```
+
+`<build>` matches the end of a CI artifact's name, so you can tell which download is installed. An OBS older than 32.0.0 logs `requires OBS 32.0.0 or later` and the plugin stays off. Dockbreak is also listed in Tools > Plugin Manager.
 
 ## Building
 
