@@ -318,6 +318,8 @@ void DockBreak::finishedLoading()
 	sweep();
 
 	for (QDockWidget *dock : std::as_const(tracked)) {
+		noteDocked(dock);
+
 		if (!dock->isFloating() || !dock->isVisible())
 			continue;
 
@@ -399,6 +401,7 @@ void DockBreak::track(QDockWidget *dock)
 
 	connect(dock, &QObject::destroyed, this, [this, dock] {
 		tracked.remove(dock);
+		lastDocked.remove(dock);
 		forgetFrame(dock);
 	});
 
@@ -433,6 +436,15 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 		 * front. Only for a moment: after that, clicking OBS is the
 		 * operator bringing OBS forward, over a maximised dock too.
 		 */
+		/* Docks laid out while OBS was still hidden become visible with
+		 * it, without moving: note where they sit. */
+		if (event->type() == QEvent::Show) {
+			QTimer::singleShot(0, this, [this] {
+				for (QDockWidget *dock : std::as_const(tracked))
+					noteDocked(dock);
+			});
+		}
+
 		if (event->type() == QEvent::WindowActivate && keepInFront.isValid() &&
 		    keepInFront.elapsed() < KEEP_IN_FRONT_MS)
 			raiseFloating("obs-activated after a pop-out");
@@ -467,6 +479,13 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 		/* Before show_sys(): the native window never appears owned,
 		 * without a taskbar button, or with the wrong title bar. */
 		diag(dock, event->spontaneous() ? "show (spontaneous)" : "show");
+		if (!dock->isFloating()) {
+			/* After the show, once the layout has placed it. */
+			QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+				if (guarded && tracked.contains(guarded.data()))
+					noteDocked(guarded);
+			});
+		}
 		if (dock->isFloating()) {
 			release(dock);
 			applyTitleBar(dock);
@@ -519,8 +538,10 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 
 	case QEvent::Move:
 	case QEvent::Resize:
-		if (!dock->isFloating())
+		if (!dock->isFloating()) {
+			noteDocked(dock);
 			break;
+		}
 
 		if (!dock->isVisible()) {
 			/* Qt placing the dock before it is shown: its own choice
@@ -573,15 +594,22 @@ void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
 		applyTitleBar(dock);
 
 		/*
-		 * Dragging a dock out of the main window floats it under the
-		 * cursor and then grabs the mouse to carry it
-		 * (QDockWidgetPrivate::mouseMoveEvent: startDrag(), grabMouse()).
-		 * Moving it then would snatch it out from under the pointer. Every
-		 * other way of floating -- the float button, a double-click, the
-		 * Docks menu -- gets the saved position.
+		 * A dock that is floated starts from its default shape: its
+		 * docked size, where it was docked. Its shape from an earlier
+		 * float is not brought back -- once re-docked, that is gone.
+		 *
+		 * Qt would bring it back: setFloating() floats a dock at the
+		 * geometry it last had while floating
+		 * (QDockWidgetPrivate::undockedGeometry), so the float button and
+		 * a double-click are put right here. Dragging a dock out does not
+		 * use that geometry -- it floats at the docked size under the
+		 * cursor and grabs the mouse to carry it
+		 * (QDockWidgetPrivate::mouseMoveEvent: startDrag(), grabMouse())
+		 * -- and is left alone. So are OBS's own placements (its layout
+		 * at startup, Reset UI, a layout repair).
 		 */
-		if (loaded && dock->isVisible() && QWidget::mouseGrabber() != dock)
-			restoreGeometry(dock);
+		if (loaded && !repairing && dock->isVisible() && QWidget::mouseGrabber() != dock)
+			placeAtDefault(dock);
 
 		diag(dock, "floated (done)");
 		QTimer::singleShot(500, this, [this, dock] {
@@ -703,7 +731,9 @@ void DockBreak::checkDocked(QPointer<QDockWidget> dock)
 			"dock '%s' was docked at %d,%d %dx%d, outside its dock area -- rebuilding the dock layout",
 			dock_name(dock).constData(), lost.x(), lost.y(), lost.width(), lost.height());
 
+		repairing = true;
 		main->restoreState(main->saveState());
+		repairing = false;
 
 		for (QDockWidget *other : std::as_const(tracked)) {
 			if (!misplaced(other))
@@ -966,23 +996,11 @@ bool DockBreak::captionDoubleClicked(void *hwnd)
 	return true;
 }
 
-/*
- * Re-docks a floating dock the way QDockWidget would, from its last normal
- * floating geometry, so that is where it floats next time.
- */
+/* Re-docks a floating dock the way QDockWidget would. */
 void DockBreak::redock(QPointer<QDockWidget> dock)
 {
 	if (!dock || !dock->isFloating())
 		return;
-
-	QRect normal;
-	if (lastClient.contains(dock))
-		normal = lastClient.value(dock);
-	else if (store.contains(dock->objectName()))
-		normal = store.get(dock->objectName());
-
-	if (normal.isValid() && dock->geometry() != normal)
-		dock->setGeometry(normal);
 
 	dock->setFloating(false);
 }
@@ -1034,27 +1052,37 @@ void DockBreak::rememberGeometry(QDockWidget *dock)
 		saveTimer.start();
 }
 
-void DockBreak::restoreGeometry(QDockWidget *dock)
+/*
+ * Notes where a docked dock sits in the main window: the shape it starts from
+ * when it is next floated (placeAtDefault). Not a placement the layout repair
+ * is about to undo.
+ */
+void DockBreak::noteDocked(QDockWidget *dock)
 {
-	const QString name = dock->objectName();
-	if (!store.contains(name))
+	if (!dock->isFloating() && dock->isVisible() && !misplaced(dock))
+		lastDocked.insert(dock, dock->geometry());
+}
+
+/*
+ * Puts a just-floated dock at its default shape: the size and place it had
+ * docked, which is what Qt does the first time a dock is floated
+ * (QDockWidgetPrivate::setFloating: "Keep position when undocking for the
+ * first time"). Nothing if it has not been seen docked.
+ */
+void DockBreak::placeAtDefault(QDockWidget *dock)
+{
+	if (!main || !lastDocked.contains(dock))
 		return;
 
-	const QRect rect = store.get(name);
-	if (rect == dock->geometry())
+	const QRect docked = lastDocked.value(dock);
+	const QRect target(main->mapToGlobal(docked.topLeft()), docked.size());
+	if (target == dock->geometry())
 		return;
 
-	/* A monitor may have been unplugged since the position was saved.
-	 * Better to leave the dock where Qt put it than to float it off
-	 * screen, where the operator cannot reach it. */
-	obs_log(LOG_INFO, "diag restore-geometry '%s' -> %d,%d %dx%d", dock_name(dock).constData(), rect.x(), rect.y(),
-		rect.width(), rect.height());
-
-	if (!QGuiApplication::screenAt(rect.center())) {
-		obs_log(LOG_INFO, "saved position of dock '%s' is off screen -- leaving it where it is",
-			dock_name(dock).constData());
+	/* The main window may be partly off screen; never float a dock where
+	 * the operator cannot reach it. */
+	if (!QGuiApplication::screenAt(target.center()))
 		return;
-	}
 
-	dock->setGeometry(rect);
+	dock->setGeometry(target);
 }

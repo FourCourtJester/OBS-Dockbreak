@@ -11,12 +11,12 @@ The plugin applies to every dock, whether it comes from OBS, another plugin, or 
 | State | What Dockbreak does |
 | --- | --- |
 | Dock is in the main window | Nothing. |
-| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open and in front. Gives it a normal title bar with minimise and maximise buttons (so Windows 11 Snap Layouts work), and a taskbar button. Remembers where it is. |
-| Popped-out dock is docked again | Nothing. Its last position is kept, so if it is popped out again (float button, double-click on the title bar, or the Docks menu) it reappears in the same place. |
+| Dock is popped out | Makes it independent of the main window, so minimising OBS leaves it open and in front. Gives it a normal title bar with minimise and maximise buttons (so Windows 11 Snap Layouts work), and a taskbar button. You can shape it however you like; it keeps that shape while it stays popped out, including across OBS restarts. |
+| Popped-out dock is docked again | Its popped-out shape is forgotten. The next time it is popped out, however that is done, it starts from its default shape: its docked size, where it was docked. |
 
 - A dock that was popped out when OBS closed comes back popped out and independent when OBS starts. OBS restores the layout; Dockbreak releases the dock.
-- Dragging a dock out of the main window leaves it under the cursor. The saved position is not applied, so the dock is not snatched away mid-drag.
-- If a saved position is no longer on any screen (for example, a monitor was unplugged), the dock is left where Qt puts it.
+- Dragging a dock out of the main window leaves it under the cursor, at its docked size.
+- A dock that was maximised when OBS closed comes back maximised, and its restore button returns it to the size it had before.
 - Docks added while OBS is running, such as a new custom browser dock, are handled straight away.
 - On Windows, a popped-out dock's title bar is light or dark to match OBS's theme, and follows it when you change theme.
 - Repairs OBS's dock layout when a re-docked dock isn't placed. On OBS 33 (Qt 6.11), after a popped-out dock has been moved by its title bar, double-clicking a dock to re-dock it can leave it docked but invisible, and every later re-dock too, until OBS restarts. Dockbreak notices a re-docked dock outside the dock areas and rebuilds the layout the way a restart does. Popped-out docks blink once while it does.
@@ -40,13 +40,13 @@ The detail is in the comments in [`src/DockBreak.hpp`](src/DockBreak.hpp).
 
 ## Stored data
 
-The only thing Dockbreak saves is the last floating position of each dock, keyed by the dock's object name. It lives in the plugin's own file, not in OBS's configuration:
+The only thing Dockbreak saves is, for each popped-out dock, its normal size and whether it is maximised, keyed by the dock's object name. It is used only to bring a dock that was maximised when OBS closed back maximised over its normal size. It lives in the plugin's own file, not in OBS's configuration:
 
 ```
 %APPDATA%\obs-studio\plugin_config\obs-dockbreak\detached-docks.json
 ```
 
-The file is disposable. If you delete it, the only effect is that docks reopen where Qt puts them.
+The file is disposable. If you delete it, the only effect is that a dock maximised when OBS closed comes back as a large ordinary window instead.
 
 ## Requirements
 
@@ -70,7 +70,7 @@ The build compiles against the OBS 31.1.1 headers pinned in `buildspec.json`, th
 
 1. Pop out a dock. Minimise OBS. The dock stays on screen.
 2. Restore OBS and dock the dock again. It goes back into the main window.
-3. Pop it out again with the float button. It reappears where it was.
+3. Reshape it, dock it, and pop it out again with the float button. It starts from its docked size, where it was docked, not the shape you gave it.
 4. Restart OBS with the dock popped out. It comes back popped out, and stays open when OBS is minimised.
 5. Do the same with a custom browser dock, and check that it still renders after each step.
 6. Switch Lock UI on and off with a dock popped out, then minimise OBS. The dock stays open.

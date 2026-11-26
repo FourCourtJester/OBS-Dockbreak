@@ -94,10 +94,11 @@ class QWindow;
  *
  * GEOMETRY
  *
- * While a dock floats, its geometry is remembered under its object name. When
- * it is floated again -- by the float button, a double-click or the Docks menu,
- * not by dragging it out, which places it under the cursor -- it is put back
- * where it last was, even across restarts during which it stayed docked.
+ * A floating dock keeps whatever shape the operator gives it, including across
+ * restarts (OBS's own layout does that; a dock maximised when OBS closes comes
+ * back maximised -- see finishedLoading). Once it is re-docked that shape is
+ * gone: the next time it floats it starts from its default shape, its docked
+ * size where it was docked (placeAtDefault), however it is floated.
  */
 class DockBreak : public QObject {
 	Q_OBJECT
@@ -148,7 +149,8 @@ private:
 	/* TEMPORARY: Windows test-round diagnostics. */
 	void diag(QDockWidget *dock, const char *what) const;
 	void diagAll(const char *what) const;
-	void restoreGeometry(QDockWidget *dock);
+	void placeAtDefault(QDockWidget *dock);
+	void noteDocked(QDockWidget *dock);
 
 	QPointer<QMainWindow> main;
 
@@ -175,6 +177,13 @@ private:
 	/* Since a floating dock was last shown -- see the WindowActivate
 	 * handling in eventFilter. */
 	QElapsedTimer keepInFront;
+
+	/* Each dock's geometry in the main window while docked: the shape it
+	 * starts from when floated (placeAtDefault). */
+	QHash<QDockWidget *, QRect> lastDocked;
+
+	/* True while checkDocked() rebuilds the layout. */
+	bool repairing = false;
 
 	/* Docks with a geometry recording queued (scheduleRecord). */
 	QSet<QDockWidget *> pendingRecord;
