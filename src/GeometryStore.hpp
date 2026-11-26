@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <QHash>
 #include <QRect>
+#include <QSet>
 #include <QString>
 
 /*
@@ -42,10 +43,16 @@ public:
 	/* Returns true when the stored value actually changed. */
 	bool set(const QString &name, const QRect &rect);
 
+	/* Whether the dock was maximised when last seen floating. Its stored
+	 * geometry stays the normal one underneath. */
+	bool isMaximized(const QString &name) const { return maximized.contains(name); }
+	bool setMaximized(const QString &name, bool on);
+
 	bool isDirty() const { return dirty; }
 
 private:
 	QString path;
 	QHash<QString, QRect> geometry;
+	QSet<QString> maximized;
 	bool dirty = false;
 };

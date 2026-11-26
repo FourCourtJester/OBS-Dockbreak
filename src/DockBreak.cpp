@@ -56,6 +56,11 @@ static constexpr int SAVE_DELAY_MS = 1000;
  * (AnimatedDocks), for SH_Widget_Animation_Duration -- 200 ms. */
 static constexpr int DOCK_SETTLE_MS = 250;
 
+/* How long Windows is given to un-maximise a dock before it is re-docked:
+ * the restore arrives asynchronously, and Qt remembers the size a dock had
+ * when it docked as the size to float it at next time. */
+static constexpr int UNMAXIMISE_SETTLE_MS = 150;
+
 /* The shortest gap between two layout repairs. */
 static constexpr int REPAIR_INTERVAL_MS = 2000;
 
@@ -288,16 +293,36 @@ DockBreak::~DockBreak()
 
 void DockBreak::finishedLoading()
 {
-	loaded = true;
-
-	/* Catches anything restored floating before it was ever polished, and
-	 * records where OBS put each floating dock as the starting point. */
+	/* Catches anything restored floating before it was ever polished. */
 	sweep();
 
 	for (QDockWidget *dock : std::as_const(tracked)) {
-		if (dock->isFloating() && dock->isVisible())
-			rememberGeometry(dock);
+		if (!dock->isFloating() || !dock->isVisible())
+			continue;
+
+		/*
+		 * A dock that was maximised when OBS closed comes back from
+		 * OBS's layout as an ordinary window the size of the screen:
+		 * saveState() records the geometry a dock has, maximised or
+		 * not. Put its normal geometry back underneath and maximise it
+		 * properly, so the restore button returns it to that size.
+		 */
+		const QString name = dock->objectName();
+		if (store.isMaximized(name) && store.contains(name)) {
+			dock->setGeometry(store.get(name));
+			dock->showMaximized();
+			obs_log(LOG_INFO, "dock '%s' was maximised when OBS closed -- maximising it again",
+				dock_name(dock).constData());
+			continue;
+		}
+
+		/* Where OBS put it is the starting point from now on. */
+		rememberGeometry(dock);
 	}
+
+	/* Only now: until here OBS is still placing docks from its layout,
+	 * and its placements are not recorded (see eventFilter). */
+	loaded = true;
 
 	diagAll("finished-loading");
 }
@@ -380,6 +405,17 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 				raiseFloating(main->isMinimized() ? "obs-minimized" : "obs-restored");
 		}
 
+		/*
+		 * An owned window always stays above its owner. Released, a dock
+		 * goes under OBS as soon as OBS is activated -- including the
+		 * moment it is popped out, since that is a click in OBS. Putting
+		 * the docks back in front whenever OBS becomes active restores
+		 * what owning them did; Windows has finished raising OBS by the
+		 * time the deferred raise runs.
+		 */
+		if (event->type() == QEvent::WindowActivate)
+			raiseFloating("obs-activated");
+
 		switch (event->type()) {
 		case QEvent::WindowStateChange:
 		case QEvent::Show:
@@ -437,6 +473,11 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 
 	case QEvent::WindowStateChange:
 		diag(dock, "window-state");
+		/* Remembered so a dock maximised when OBS closes comes back
+		 * maximised (finishedLoading). Not before OBS has finished
+		 * restoring its layout, which is what is being remembered. */
+		if (loaded && dock->isFloating() && store.setMaximized(dock->objectName(), dock->isMaximized()))
+			saveTimer.start();
 		break;
 
 	case QEvent::ApplicationPaletteChange:
@@ -888,18 +929,48 @@ bool DockBreak::captionDoubleClicked(void *hwnd)
 	if (!dock)
 		return false;
 
-	QTimer::singleShot(0, this, [guarded = QPointer<QDockWidget>(dock)] {
+	QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
 		if (!guarded || !guarded->isFloating())
 			return;
 
-		/* A maximised dock would otherwise float maximised next time. */
+		/*
+		 * A maximised dock is un-maximised first, or it would float at
+		 * full-screen size next time: Qt keeps the size a floating dock
+		 * last had (QDockWidgetPrivate::undockedGeometry, updated on
+		 * every resize) and floats it there again. Windows applies the
+		 * restore asynchronously, so the re-dock waits for it.
+		 */
 		const Qt::WindowStates sized = Qt::WindowMaximized | Qt::WindowFullScreen;
-		if (guarded->windowState() & sized)
+		if (guarded->windowState() & sized) {
 			guarded->setWindowState(guarded->windowState() & ~sized);
+			QTimer::singleShot(UNMAXIMISE_SETTLE_MS, this, [this, guarded] { redock(guarded); });
+			return;
+		}
 
-		guarded->setFloating(false);
+		redock(guarded);
 	});
 	return true;
+}
+
+/*
+ * Re-docks a floating dock the way QDockWidget would, from its last normal
+ * floating geometry, so that is where it floats next time.
+ */
+void DockBreak::redock(QPointer<QDockWidget> dock)
+{
+	if (!dock || !dock->isFloating())
+		return;
+
+	QRect normal;
+	if (lastClient.contains(dock))
+		normal = lastClient.value(dock);
+	else if (store.contains(dock->objectName()))
+		normal = store.get(dock->objectName());
+
+	if (normal.isValid() && dock->geometry() != normal)
+		dock->setGeometry(normal);
+
+	dock->setFloating(false);
 }
 
 /* A docked dock has no frame of ours: the next float starts afresh. */

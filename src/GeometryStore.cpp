@@ -39,6 +39,7 @@ GeometryStore::GeometryStore(QString path_) : path(std::move(path_)) {}
 void GeometryStore::load()
 {
 	geometry.clear();
+	maximized.clear();
 	dirty = false;
 
 	if (path.isEmpty())
@@ -75,8 +76,11 @@ void GeometryStore::load()
 		const QRect rect(g.value("x").toInt(), g.value("y").toInt(), g.value("width").toInt(),
 				 g.value("height").toInt());
 
-		if (!it.key().isEmpty() && rect.isValid())
+		if (!it.key().isEmpty() && rect.isValid()) {
 			geometry.insert(it.key(), rect);
+			if (g.value("maximized").toBool())
+				maximized.insert(it.key());
+		}
 	}
 
 	obs_log(LOG_INFO, "loaded saved geometry for %d dock(s)", int(geometry.size()));
@@ -96,6 +100,19 @@ bool GeometryStore::set(const QString &name, const QRect &rect)
 	return true;
 }
 
+bool GeometryStore::setMaximized(const QString &name, bool on)
+{
+	if (name.isEmpty() || maximized.contains(name) == on)
+		return false;
+
+	if (on)
+		maximized.insert(name);
+	else
+		maximized.remove(name);
+	dirty = true;
+	return true;
+}
+
 bool GeometryStore::save()
 {
 	if (!dirty || path.isEmpty())
@@ -111,7 +128,11 @@ bool GeometryStore::save()
 	QJsonObject docks;
 	for (auto it = geometry.cbegin(); it != geometry.cend(); ++it) {
 		const QRect &r = it.value();
-		const QJsonObject entry{{"x", r.x()}, {"y", r.y()}, {"width", r.width()}, {"height", r.height()}};
+		QJsonObject entry{{"x", r.x()}, {"y", r.y()}, {"width", r.width()}, {"height", r.height()}};
+		/* Only written when true, so files from before it stay valid and
+		 * the common case stays small. */
+		if (maximized.contains(it.key()))
+			entry.insert("maximized", true);
 		docks.insert(it.key(), entry);
 	}
 

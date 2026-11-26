@@ -123,6 +123,7 @@ private:
 	void track(QDockWidget *dock);
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
 	void checkDocked(QPointer<QDockWidget> dock);
+	void redock(QPointer<QDockWidget> dock);
 	bool misplaced(QDockWidget *dock) const;
 
 public:
