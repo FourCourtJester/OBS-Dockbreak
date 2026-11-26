@@ -1,0 +1,952 @@
+/*
+Dockbreak
+Copyright (C) 2026 FourCourtJester <shaun@mse.gg>
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>
+*/
+
+#include "DockBreak.hpp"
+
+#include <obs-module.h>
+#include <obs-frontend-api.h>
+#include <plugin-support.h>
+
+#include <QAbstractNativeEventFilter>
+#include <QChildEvent>
+#include <QCoreApplication>
+#include <QDockWidget>
+#include <QEvent>
+#include <QGuiApplication>
+#include <QMainWindow>
+#include <QScreen>
+#include <QWindow>
+#include <QWindowStateChangeEvent>
+
+#include <memory>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <dwmapi.h>
+#endif
+
+/* Window moves and resizes arrive in bursts while the operator drags. The file
+ * is written once things settle, and again on exit. */
+static constexpr int SAVE_DELAY_MS = 1000;
+
+/* How long a re-docked dock is given to settle before it is checked for
+ * having landed outside its dock area. QMainWindow animates docks into place
+ * (AnimatedDocks), for SH_Widget_Animation_Duration -- 200 ms. */
+static constexpr int DOCK_SETTLE_MS = 250;
+
+/* How long Windows is given to un-maximise a dock before it is re-docked:
+ * the restore arrives asynchronously, and Qt remembers the size a dock had
+ * when it docked as the size to float it at next time. */
+static constexpr int UNMAXIMISE_SETTLE_MS = 150;
+
+/* How long after a dock pops out OBS becoming active still puts it back in
+ * front. Popping out is a click in OBS; after that, clicking OBS is the
+ * operator bringing OBS forward, and is left alone. */
+static constexpr int KEEP_IN_FRONT_MS = 1500;
+
+/* The shortest gap between two layout repairs. */
+static constexpr int REPAIR_INTERVAL_MS = 2000;
+
+/* When OBS minimises, Windows activates the next window in line once the
+ * minimise has run, which can land on top of the docks. They are raised
+ * straight away and again after this long. */
+static constexpr int RAISE_AGAIN_MS = 300;
+
+static QByteArray dock_name(const QDockWidget *dock)
+{
+	return dock->objectName().toUtf8();
+}
+
+#ifdef _WIN32
+/*
+ * Puts `hwnd` at the top of the ordinary (not always-on-top) windows, without
+ * activating it.
+ *
+ * SetWindowPos(HWND_TOP), which is what QWidget::raise() does on Windows, is
+ * not enough when OBS is not the foreground program: Windows keeps the
+ * foreground window above it, and a Windows test showed another program's
+ * window still covering the dock after it. Making the window always-on-top
+ * and then not is the usual way round that. HWND_NOTOPMOST is documented to
+ * place the window above all non-topmost windows, and it ends in the same
+ * not-always-on-top state that Qt believes the dock to be in.
+ */
+static void bring_to_front(HWND hwnd);
+
+/*
+ * Whether Windows has snapped the window (Aero Snap, Snap Layouts). A snapped
+ * window is not maximised -- to Qt it is an ordinary window of a new size --
+ * but Windows keeps its earlier size to restore it to, and so should we.
+ * IsWindowArranged is looked up at run time: it is only in newer user32s.
+ */
+static bool is_snapped(HWND hwnd)
+{
+	using IsWindowArrangedFn = BOOL(WINAPI *)(HWND);
+	static const IsWindowArrangedFn isArranged = reinterpret_cast<IsWindowArrangedFn>(
+		reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "IsWindowArranged")));
+	return hwnd && isArranged && isArranged(hwnd);
+}
+
+static void bring_to_front(HWND hwnd)
+{
+	const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+	SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+	SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+}
+
+/*
+ * The attribute Qt itself uses for dark title bars
+ * (QWindowsWindow::setDarkBorderToWindow): DWMWA_USE_IMMERSIVE_DARK_MODE is 20
+ * from Windows 10 20H1 on, and was 19 before it. Both are tried, as Qt does.
+ */
+static bool set_dark_title_bar(HWND hwnd, bool dark)
+{
+	const BOOL value = dark ? TRUE : FALSE;
+	return SUCCEEDED(DwmSetWindowAttribute(hwnd, 20, &value, sizeof(value))) ||
+	       SUCCEEDED(DwmSetWindowAttribute(hwnd, 19, &value, sizeof(value)));
+}
+#endif
+
+#ifdef _WIN32
+/*
+ * Takes title-bar double-clicks on floating docks away from Windows.
+ *
+ * Qt passes non-client mouse messages on to DefWindowProc after acting on
+ * them (qwindowspointerhandler.cpp: "Let DefWindowProc() handle Non Client
+ * messages"). For a window with a maximise button, DefWindowProc turns a
+ * caption double-click into a maximise -- at the same moment as QDockWidget
+ * turns it into a re-dock. The message is consumed here, before either sees
+ * it, and the re-dock done by captionDoubleClicked().
+ */
+class CaptionDoubleClickFilter : public QAbstractNativeEventFilter {
+public:
+	explicit CaptionDoubleClickFilter(DockBreak *owner_) : owner(owner_) {}
+
+	bool nativeEventFilter(const QByteArray &eventType, void *message, qintptr *result) override
+	{
+		if (eventType != "windows_generic_MSG")
+			return false;
+
+		const MSG *msg = static_cast<const MSG *>(message);
+		if (msg->message != WM_NCLBUTTONDBLCLK || msg->wParam != HTCAPTION)
+			return false;
+
+		if (!owner->captionDoubleClicked(msg->hwnd))
+			return false;
+
+		/*
+		 * Qt runs native event filters from two places on Windows, and
+		 * only one has a result to give. The event dispatcher filters
+		 * every queued message before dispatching it, with a NULL result
+		 * (QEventDispatcherWin32::processEvents: filterNativeEvent(...,
+		 * &msg, 0)); returning true there means the message is never
+		 * translated or dispatched at all. The window procedure filters
+		 * again with a real LRESULT. A double-click is a queued message,
+		 * so it arrives through the dispatcher first. Writing through
+		 * that NULL is what crashed OBS on every title-bar double-click.
+		 */
+		if (result)
+			*result = 0;
+		return true;
+	}
+
+private:
+	DockBreak *owner;
+};
+#endif
+
+DockBreak::DockBreak(QMainWindow *main_, const QString &storePath) : main(main_), store(storePath)
+{
+	store.load();
+
+	saveTimer.setSingleShot(true);
+	saveTimer.setInterval(SAVE_DELAY_MS);
+	connect(&saveTimer, &QTimer::timeout, this, [this] { store.save(); });
+
+	/*
+	 * New docks are found through the main window rather than by a one-off
+	 * search, so docks registered later -- by plugins whose post_load runs
+	 * after ours, or browser docks added from the Tools menu while OBS is
+	 * running -- are picked up too.
+	 *
+	 * ChildPolished rather than ChildAdded: ChildAdded is sent from inside
+	 * the child's QWidget constructor, before it is a QDockWidget, so the
+	 * cast would fail. Polish happens on the first show, which is the first
+	 * moment a dock can need releasing anyway.
+	 */
+	main->installEventFilter(this);
+	sweep();
+
+#ifdef _WIN32
+	captionFilter = std::make_unique<CaptionDoubleClickFilter>(this);
+	QCoreApplication::instance()->installNativeEventFilter(captionFilter.get());
+#endif
+}
+
+DockBreak::~DockBreak()
+{
+	/* Deliberately touches no widget: by the time this runs from
+	 * obs_module_unload() the main window may already be gone. Everything
+	 * that needs the frontend happens in shutdown(). Writing the file needs
+	 * nothing but the file, and does nothing if shutdown() already did it. */
+	store.save();
+
+#ifdef _WIN32
+	if (captionFilter && QCoreApplication::instance())
+		QCoreApplication::instance()->removeNativeEventFilter(captionFilter.get());
+#endif
+}
+
+void DockBreak::finishedLoading()
+{
+	/* Catches anything restored floating before it was ever polished. */
+	sweep();
+
+	for (QDockWidget *dock : std::as_const(tracked)) {
+		noteDocked(dock);
+
+		if (!dock->isFloating() || !dock->isVisible())
+			continue;
+
+		/*
+		 * A dock that was maximised when OBS closed comes back from
+		 * OBS's layout as an ordinary window the size of the screen:
+		 * saveState() records the geometry a dock has, maximised or
+		 * not. Put its normal geometry back underneath and maximise it
+		 * properly, so the restore button returns it to that size.
+		 */
+		const QString name = dock->objectName();
+		if (store.isMaximized(name) && store.contains(name)) {
+			dock->setGeometry(store.get(name));
+			dock->showMaximized();
+			obs_log(LOG_INFO, "dock '%s' was maximised when OBS closed -- maximising it again",
+				dock_name(dock).constData());
+			continue;
+		}
+
+		/* Where OBS put it is the starting point from now on. */
+		rememberGeometry(dock);
+	}
+
+	/* Only now: until here OBS is still placing docks from its layout,
+	 * and its placements are not recorded (see eventFilter). */
+	loaded = true;
+}
+
+void DockBreak::themeChanged()
+{
+	for (QDockWidget *dock : std::as_const(tracked))
+		applyTitleBar(dock);
+}
+
+void DockBreak::shutdown()
+{
+	saveTimer.stop();
+	store.save();
+
+	if (main)
+		main->removeEventFilter(this);
+
+#ifdef _WIN32
+	if (captionFilter) {
+		QCoreApplication::instance()->removeNativeEventFilter(captionFilter.get());
+		captionFilter.reset();
+	}
+#endif
+
+	for (QDockWidget *dock : std::as_const(tracked)) {
+		dock->removeEventFilter(this);
+		disconnect(dock, nullptr, this, nullptr);
+	}
+	tracked.clear();
+}
+
+void DockBreak::sweep()
+{
+	if (!main)
+		return;
+
+	const auto docks = main->findChildren<QDockWidget *>(Qt::FindDirectChildrenOnly);
+	for (QDockWidget *dock : docks)
+		track(dock);
+}
+
+void DockBreak::track(QDockWidget *dock)
+{
+	if (!dock || tracked.contains(dock))
+		return;
+
+	tracked.insert(dock);
+	dock->installEventFilter(this);
+
+	connect(dock, &QDockWidget::topLevelChanged, this,
+		[this, guarded = QPointer<QDockWidget>(dock)](bool floating) { onTopLevelChanged(guarded, floating); });
+
+	connect(dock, &QObject::destroyed, this, [this, dock] {
+		tracked.remove(dock);
+		lastDocked.remove(dock);
+		forgetFrame(dock);
+	});
+
+	if (dock->isFloating()) {
+		release(dock);
+		applyTitleBar(dock);
+	}
+}
+
+bool DockBreak::eventFilter(QObject *watched, QEvent *event)
+{
+	if (watched == main) {
+		if (event->type() == QEvent::ChildPolished) {
+			auto *child = static_cast<QChildEvent *>(event)->child();
+			if (auto *dock = qobject_cast<QDockWidget *>(child))
+				track(dock);
+		}
+
+		if (event->type() == QEvent::WindowStateChange) {
+			const bool wasMinimized = static_cast<QWindowStateChangeEvent *>(event)->oldState() &
+						  Qt::WindowMinimized;
+			if (main->isMinimized() != wasMinimized)
+				raiseFloating(main->isMinimized() ? "obs-minimized" : "obs-restored");
+		}
+
+		/* Docks laid out while OBS was still hidden become visible with
+		 * it, without moving: note where they sit. */
+		if (event->type() == QEvent::Show) {
+			QTimer::singleShot(0, this, [this] {
+				for (QDockWidget *dock : std::as_const(tracked))
+					noteDocked(dock);
+			});
+		}
+
+		/*
+		 * Popping a dock out is a click in OBS, and OBS becoming active
+		 * puts it above the unowned dock that just appeared. So for a
+		 * moment after a pop-out, OBS's activation puts the docks back in
+		 * front. Only for a moment: after that, clicking OBS is the
+		 * operator bringing OBS forward, over a maximised dock too.
+		 */
+		if (event->type() == QEvent::WindowActivate && keepInFront.isValid() &&
+		    keepInFront.elapsed() < KEEP_IN_FRONT_MS)
+			raiseFloating("obs-activated after a pop-out");
+
+		return false;
+	}
+
+	auto *dock = qobject_cast<QDockWidget *>(watched);
+	if (!dock || !tracked.contains(dock))
+		return false;
+
+	switch (event->type()) {
+	case QEvent::Show:
+		/* Before show_sys(): the native window never appears owned,
+		 * without a taskbar button, or with the wrong title bar. */
+		if (!dock->isFloating()) {
+			/* After the show, once the layout has placed it. */
+			QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+				if (guarded && tracked.contains(guarded.data()))
+					noteDocked(guarded);
+			});
+		}
+		if (dock->isFloating()) {
+			release(dock);
+			applyTitleBar(dock);
+
+			/*
+			 * An owned window always appeared above OBS. Unowned, and
+			 * shown without activating, it appears wherever Windows
+			 * puts it -- a first undock was seen landing under OBS.
+			 * Once it is on screen, bring it forward, as owning it
+			 * used to. A Windows-initiated show (restoring from the
+			 * taskbar) already brings it forward itself.
+			 */
+			if (!event->spontaneous()) {
+				keepInFront.start();
+				for (const int delay : {0, RAISE_AGAIN_MS}) {
+					QTimer::singleShot(delay, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+						if (guarded && tracked.contains(guarded.data()))
+							raiseDock(guarded);
+					});
+				}
+			}
+		}
+		break;
+
+	case QEvent::WindowStateChange:
+		/* Remembered so a dock maximised when OBS closes comes back
+		 * maximised (finishedLoading). Not before OBS has finished
+		 * restoring its layout, which is what is being remembered. */
+		if (loaded && dock->isFloating() && store.setMaximized(dock->objectName(), dock->isMaximized()))
+			saveTimer.start();
+		break;
+
+	case QEvent::ApplicationPaletteChange:
+	case QEvent::PaletteChange:
+	case QEvent::ThemeChange:
+		/*
+		 * Qt decides the title bar again on these, by its own rule
+		 * (QWindowsWindow::windowEvent -> setDarkBorder), which follows
+		 * the Windows colour mode rather than OBS's theme. Ours goes back
+		 * on once Qt has finished.
+		 */
+		if (dock->isFloating())
+			scheduleTitleBar(dock);
+		break;
+
+	case QEvent::Move:
+	case QEvent::Resize:
+		if (!dock->isFloating()) {
+			noteDocked(dock);
+			break;
+		}
+
+		if (!dock->isVisible()) {
+			/* Qt placing the dock before it is shown: its own choice
+			 * of where the contents go. See giveTitleBarButtons(). */
+			explicitGeometry.insert(dock);
+			break;
+		}
+
+		scheduleRecord(dock);
+		break;
+
+	default:
+		break;
+	}
+
+	return false;
+}
+
+void DockBreak::onTopLevelChanged(QPointer<QDockWidget> dock, bool floating)
+{
+	/*
+	 * Qt is in the middle of QDockWidgetPrivate::setWindowState() when this
+	 * signal fires, and possibly in the middle of QMainWindowLayout's unplug
+	 * as well. Nothing is changed from inside it; the work runs once control
+	 * is back in the event loop.
+	 */
+	QTimer::singleShot(0, this, [this, dock, floating] {
+		if (!dock || !tracked.contains(dock.data()))
+			return;
+
+		/* Floated and docked again (or the reverse) before we got here:
+		 * the later signal has its own turn queued. */
+		if (dock->isFloating() != floating)
+			return;
+
+		if (!floating) {
+			/* Back in the main window. Its saved geometry is kept, so
+			 * the next float puts it back where it was. */
+			forgetFrame(dock);
+			checkDocked(dock);
+			return;
+		}
+
+		release(dock);
+		applyTitleBar(dock);
+
+		/*
+		 * A dock that is floated starts from its default shape: its
+		 * docked size, where it was docked. Its shape from an earlier
+		 * float is not brought back -- once re-docked, that is gone.
+		 *
+		 * Qt would bring it back: setFloating() floats a dock at the
+		 * geometry it last had while floating
+		 * (QDockWidgetPrivate::undockedGeometry), so the float button and
+		 * a double-click are put right here. Dragging a dock out does not
+		 * use that geometry -- it floats at the docked size under the
+		 * cursor and grabs the mouse to carry it
+		 * (QDockWidgetPrivate::mouseMoveEvent: startDrag(), grabMouse())
+		 * -- and is left alone. So are OBS's own placements (its layout
+		 * at startup, Reset UI, a layout repair).
+		 */
+		if (loaded && !repairing && dock->isVisible() && QWidget::mouseGrabber() != dock)
+			placeAtDefault(dock);
+	});
+}
+
+/*
+ * Brings every visible floating dock to the front, without activating it.
+ *
+ * While OBS owned its floating docks, Windows kept them above OBS: they went
+ * away with it and came back with it. Released, a dock is an ordinary window
+ * in the z-order. When OBS minimises, Windows activates the next window in
+ * line -- often whatever is behind OBS -- which then covers the dock; the
+ * dock is still on screen, just buried. And restoring OBS brings only OBS
+ * back to the front.
+ *
+ * So both are done by hand: on minimise, the docks are raised once Windows
+ * has picked the next window; on restore, once OBS is in front again, so they
+ * sit above it as they used to. On Windows that is bring_to_front(), which
+ * beats the foreground window where QWidget::raise() does not; either way
+ * the dock comes forward without taking focus from whatever has it.
+ */
+void DockBreak::raiseFloating(const char *why)
+{
+	const auto raiseAll = [this] {
+		for (QDockWidget *dock : std::as_const(tracked))
+			raiseDock(dock);
+	};
+
+	QTimer::singleShot(0, this, raiseAll);
+	QTimer::singleShot(RAISE_AGAIN_MS, this, raiseAll);
+
+	obs_log(LOG_DEBUG, "%s: bringing floating docks to the front", why);
+}
+
+/* Brings one floating dock to the front, without activating it. */
+void DockBreak::raiseDock(QDockWidget *dock)
+{
+	/* A dock the operator minimised stays minimised. */
+	if (!dock->isFloating() || !dock->isVisible() || dock->isMinimized())
+		return;
+
+#ifdef _WIN32
+	if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId()))
+		bring_to_front(hwnd);
+	else
+		dock->raise();
+#else
+	dock->raise();
+#endif
+}
+
+/*
+ * True for a dock that is docked and visible but not where any dock can be:
+ * outside the main window, or over its central widget (the preview). Docked
+ * docks only ever sit in the dock areas around the central widget.
+ */
+bool DockBreak::misplaced(QDockWidget *dock) const
+{
+	if (!main || dock->isFloating() || !dock->isVisible())
+		return false;
+
+	const QRect g = dock->geometry();
+	if (!main->rect().contains(g))
+		return true;
+
+	QWidget *central = main->centralWidget();
+	return central && central->isVisible() && g.intersects(central->geometry());
+}
+
+/*
+ * Repairs OBS's dock layout after Qt re-docks a dock without laying it out.
+ *
+ * WHAT GOES WRONG (Qt 6.11.1, OBS 33.0.1, and without this plugin too)
+ *
+ * Moving a floating dock by its title bar runs QMainWindowLayout::hover(),
+ * which keeps a copy of the layout (savedState) while it looks for a place
+ * to drop the dock. When the dock is not dropped into a dock area, Qt calls
+ * restore(QInternal::KeepSavedState) -- which leaves that copy in place. And
+ * while it exists, QMainWindowLayout::setGeometry() returns without doing
+ * anything. Dragging a dock back in clears it (hover() over a dock area), so
+ * that still works; re-docking with a double-click does not, so the dock is
+ * docked but never positioned: it keeps its floating coordinates, now read
+ * inside the main window. Every later re-dock fails the same way, and the
+ * Docks menu cannot help, until OBS restarts -- whose restoreState() is one
+ * of the few things that clears the copy.
+ *
+ * THE REPAIR
+ *
+ * Do what the restart does: save the layout and restore it at once. That
+ * clears savedState and lays every dock out in its slot. Any dock that the
+ * saved layout had no slot for is then put back with restoreDockWidget(),
+ * and failing that, removed and re-added to its area. Floating docks are
+ * hidden and shown once by the restore, as at startup, and the Show filter
+ * releases them again.
+ *
+ * Reproduced and checked offscreen against Qt 6.11.1: move one dock by its
+ * title bar, double-click it and a second dock; both stay unplaced until the
+ * repair, after which both are back in the right dock area.
+ */
+void DockBreak::checkDocked(QPointer<QDockWidget> dock)
+{
+	QTimer::singleShot(DOCK_SETTLE_MS, this, [this, dock] {
+		if (!dock || !main || !tracked.contains(dock.data()) || !misplaced(dock))
+			return;
+
+		/* A restore can itself re-dock things; never let repairs chase
+		 * each other. */
+		if (lastRepair.isValid() && lastRepair.elapsed() < REPAIR_INTERVAL_MS)
+			return;
+		lastRepair.start();
+
+		const QRect lost = dock->geometry();
+		obs_log(LOG_INFO,
+			"dock '%s' was docked at %d,%d %dx%d, outside its dock area -- rebuilding the dock layout",
+			dock_name(dock).constData(), lost.x(), lost.y(), lost.width(), lost.height());
+
+		repairing = true;
+		main->restoreState(main->saveState());
+		repairing = false;
+
+		for (QDockWidget *other : std::as_const(tracked)) {
+			if (!misplaced(other))
+				continue;
+
+			if (!main->restoreDockWidget(other) || misplaced(other)) {
+				Qt::DockWidgetArea area = main->dockWidgetArea(other);
+				if (area == Qt::NoDockWidgetArea)
+					area = Qt::RightDockWidgetArea;
+
+				/* addDockWidget() does not drop an existing entry, so
+				 * the dock is removed from the layout first. */
+				main->removeDockWidget(other);
+				main->addDockWidget(area, other);
+				other->show();
+			}
+		}
+
+		for (QDockWidget *other : std::as_const(tracked)) {
+			if (misplaced(other))
+				obs_log(LOG_WARNING, "dock '%s' is still outside its dock area after the repair",
+					dock_name(other).constData());
+		}
+
+		const QRect placed = dock->geometry();
+		obs_log(LOG_INFO, "dock '%s' is now at %d,%d %dx%d", dock_name(dock).constData(), placed.x(),
+			placed.y(), placed.width(), placed.height());
+	});
+}
+
+#if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
+/*
+ * Gives a floating dock a normal title bar, with minimise and maximise
+ * buttons.
+ *
+ * Qt floats a dock as a Qt::Tool window: the slim tool-window title bar,
+ * which Windows draws with a close button only, whatever else is asked for.
+ * While OBS owned the dock that was fine -- it minimised with OBS. Released,
+ * it needs its own minimise button. The maximise button is what makes a
+ * window eligible for Windows 11's Snap Layouts (drag to the top of the
+ * screen, or hover the button). So the dock's QWindow becomes a Qt::Window
+ * with WindowMinimizeButtonHint and WindowMaximizeButtonHint, keeping every
+ * other flag. Double-clicking the title bar would now also maximise it,
+ * where QDockWidget re-docks it; captionDoubleClicked() keeps the re-dock. The QWidget is left
+ * a Qt::Tool, so QDockWidget's own logic is unaffected; Qt re-applies the
+ * widget's flags to the QWindow whenever they change (QWidgetPrivate::create),
+ * and every such path ends in show(), where this runs again.
+ *
+ * Qt::Tool shows without activating (QWindowsWindow::show_sys); a
+ * Qt::Window would take focus every time it appeared. QWidget sets the same
+ * property for WA_ShowWithoutActivating, so that behaviour is kept.
+ *
+ * THE FRAME
+ *
+ * The two title bars differ in height, and Qt keeps a window's OUTER frame
+ * when its flags change, so the contents shift and resize by the
+ * difference. Left alone, a dock would creep on every swap. Which rectangle
+ * is right depends on who touched the dock last:
+ *
+ *  - Qt has just positioned it -- floated it, restored a layout -- for its
+ *    current, tool-window frame. Its contents are where Qt wants them: keep
+ *    them (explicitGeometry, set by Move/Resize while it is hidden).
+ *  - Qt only swapped our title bar back to the tool one, keeping the outer
+ *    frame -- a Lock UI toggle does this. The contents moved under it; put
+ *    them back where they last were while converted (lastClient).
+ */
+bool DockBreak::giveTitleBarButtons(QDockWidget *dock, QWindow *window)
+{
+	if (window->type() == Qt::Window)
+		return false;
+
+	const QRect before = window->geometry();
+	const QRect target = (!explicitGeometry.contains(dock) && lastClient.contains(dock)) ? lastClient.value(dock)
+											     : before;
+
+	const Qt::WindowFlags flags = (window->flags() & ~Qt::WindowType_Mask) | Qt::Window |
+				      Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint;
+
+	window->setProperty("_q_showWithoutActivating", true);
+	window->setFlags(flags);
+
+	if (window->geometry() != target)
+		window->setGeometry(target);
+
+	explicitGeometry.remove(dock);
+	return true;
+}
+#endif
+
+/*
+ * Makes a floating dock a window of its own: no owner, so minimising OBS
+ * leaves it alone, and a taskbar button, so it can be found again once OBS's
+ * main window is in front of it. Idempotent; returns true if anything changed.
+ */
+bool DockBreak::release(QDockWidget *dock)
+{
+	QWindow *window = dock->windowHandle();
+	if (!window)
+		return false;
+
+	bool changed = false;
+
+	if (window->transientParent()) {
+		window->setTransientParent(nullptr);
+		changed = true;
+	}
+
+#if defined(_WIN32) || defined(DOCKBREAK_TEST_MINIMISE_BUTTON)
+	if (giveTitleBarButtons(dock, window))
+		changed = true;
+#endif
+
+#ifdef _WIN32
+	if (HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId())) {
+		/*
+		 * Qt only pushes the transient parent to the HWND when the window
+		 * is next shown (QWindowsWindow::show_sys -> updateTransientParent).
+		 * Inside the Show filter that is about to happen anyway; for a dock
+		 * that was already on screen when we found it, it would not happen
+		 * until the dock was hidden and shown again. This is the same call
+		 * Qt makes, applied now, and it agrees with the state Qt has just
+		 * been given.
+		 */
+		if (GetWindow(hwnd, GW_OWNER))
+			SetWindowLongPtr(hwnd, GWLP_HWNDPARENT, 0);
+
+		/*
+		 * A floating dock is a Qt::Tool window, which Qt creates with
+		 * WS_EX_TOOLWINDOW: no taskbar button. That was harmless while OBS
+		 * owned the dock, since an owned window always stays above its
+		 * owner. Unowned, clicking OBS can bury the dock, so it gets a
+		 * button of its own. WS_EX_APPWINDOW puts a visible top-level window
+		 * on the taskbar even when it is a tool window.
+		 *
+		 * Why not change the dock to Qt::Window instead: that swaps the
+		 * small tool caption for a full one, and Qt keeps the OUTER frame
+		 * when the frame changes. Every switch would then shift and resize
+		 * the dock's contents by the caption difference, and the dock would
+		 * creep a few pixels on each restart or Lock UI toggle. This bit
+		 * changes nothing about the frame, so Qt's geometry stays exact.
+		 *
+		 * Qt rewrites GWL_EXSTYLE whenever the dock's window flags change
+		 * (WindowCreationData::applyWindowFlags), which drops the bit. Each
+		 * such path ends in show(), so the Show filter puts it back, and
+		 * does so before ShowWindow() -- which is when the taskbar decides
+		 * whether a window gets a button.
+		 */
+		const LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+		if (!(exStyle & WS_EX_APPWINDOW)) {
+			SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle | WS_EX_APPWINDOW);
+			changed = true;
+
+			/* The taskbar only looks at the style when a window is shown,
+			 * so one already on screen gets its button the next time it
+			 * is. Only a dock floating before this plugin started gets
+			 * here, which a dock restored by OBS's layout does not. */
+			if (IsWindowVisible(hwnd))
+				obs_log(LOG_INFO,
+					"dock '%s' was already on screen -- its taskbar button appears when it is next shown",
+					dock_name(dock).constData());
+		}
+	}
+#endif
+
+	if (changed) {
+		obs_log(LOG_DEBUG, "released floating dock '%s' from the main window", dock_name(dock).constData());
+	}
+
+	return changed;
+}
+
+/*
+ * Gives a floating dock the same light or dark title bar as OBS's theme.
+ *
+ * Qt draws a dark title bar only when Windows itself is in dark mode AND the
+ * window's palette is dark (shouldApplyDarkFrame in qwindowswindow.cpp), so a
+ * dark OBS theme on a light-mode Windows gets light title bars. OBS knows
+ * which kind its theme is -- obs_frontend_is_theme_dark() -- and that is what
+ * the dock follows. It is re-applied whenever OBS changes theme
+ * (themeChanged) and whenever Qt has re-decided it (the palette and theme
+ * events in eventFilter).
+ */
+void DockBreak::applyTitleBar(QDockWidget *dock)
+{
+#ifdef _WIN32
+	if (!dock->isFloating())
+		return;
+
+	HWND hwnd = reinterpret_cast<HWND>(dock->internalWinId());
+	if (!hwnd)
+		return;
+
+	if (!set_dark_title_bar(hwnd, obs_frontend_is_theme_dark())) {
+		/* Windows 10 before 1809 has no dark title bars at all. */
+		obs_log(LOG_DEBUG, "could not set the title bar colour of dock '%s'", dock_name(dock).constData());
+		return;
+	}
+
+	/* A window already on screen does not repaint its title bar for the
+	 * attribute alone. A frame change makes it, without moving, resizing,
+	 * activating or restacking anything -- the frame metrics are the same
+	 * in light and dark. */
+	if (IsWindowVisible(hwnd))
+		SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+			     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+				     SWP_NOACTIVATE);
+#else
+	Q_UNUSED(dock);
+#endif
+}
+
+void DockBreak::scheduleTitleBar(QDockWidget *dock)
+{
+	QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+		if (guarded && tracked.contains(guarded.data()))
+			applyTitleBar(guarded);
+	});
+}
+
+/*
+ * A title-bar double-click on `hwnd`, taken from Windows by
+ * CaptionDoubleClickFilter. Returns true if it was one of our floating docks,
+ * in which case it is re-docked the way QDockWidget would have
+ * (QDockWidgetPrivate::toggleTopLevel: setFloating(!isFloating())).
+ */
+bool DockBreak::captionDoubleClicked(void *hwnd)
+{
+	QDockWidget *dock = nullptr;
+	for (QDockWidget *candidate : std::as_const(tracked)) {
+		if (candidate->isFloating() && reinterpret_cast<void *>(candidate->internalWinId()) == hwnd) {
+			dock = candidate;
+			break;
+		}
+	}
+	if (!dock)
+		return false;
+
+	QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+		if (!guarded || !guarded->isFloating())
+			return;
+
+		/*
+		 * A maximised dock is un-maximised first, or it would float at
+		 * full-screen size next time: Qt keeps the size a floating dock
+		 * last had (QDockWidgetPrivate::undockedGeometry, updated on
+		 * every resize) and floats it there again. Windows applies the
+		 * restore asynchronously, so the re-dock waits for it.
+		 */
+		const Qt::WindowStates sized = Qt::WindowMaximized | Qt::WindowFullScreen;
+		if (guarded->windowState() & sized) {
+			guarded->setWindowState(guarded->windowState() & ~sized);
+			QTimer::singleShot(UNMAXIMISE_SETTLE_MS, this, [this, guarded] { redock(guarded); });
+			return;
+		}
+
+		redock(guarded);
+	});
+	return true;
+}
+
+/* Re-docks a floating dock the way QDockWidget would. */
+void DockBreak::redock(QPointer<QDockWidget> dock)
+{
+	if (!dock || !dock->isFloating())
+		return;
+
+	dock->setFloating(false);
+}
+
+/*
+ * Records where a floating dock is, once the move or resize that prompted it
+ * has finished: by then Windows has flagged a snap as one.
+ *
+ * Minimised, maximised, full screen or snapped is not where the dock lives,
+ * and is not recorded. Its frame (lastClient) and its saved position stay the
+ * last normal ones -- what Windows itself restores it to.
+ */
+void DockBreak::scheduleRecord(QDockWidget *dock)
+{
+	if (pendingRecord.contains(dock))
+		return;
+	pendingRecord.insert(dock);
+
+	QTimer::singleShot(0, this, [this, dock, guarded = QPointer<QDockWidget>(dock)] {
+		pendingRecord.remove(dock);
+		if (!guarded || !tracked.contains(dock) || !dock->isFloating() || !dock->isVisible())
+			return;
+		if (dock->isMinimized() || dock->isMaximized() || dock->isFullScreen())
+			return;
+#ifdef _WIN32
+		if (is_snapped(reinterpret_cast<HWND>(dock->internalWinId())))
+			return;
+#endif
+
+		if (QWindow *window = dock->windowHandle(); window && window->type() == Qt::Window)
+			lastClient.insert(dock, dock->geometry());
+
+		if (loaded)
+			rememberGeometry(dock);
+	});
+}
+
+/* A docked dock has no frame of ours: the next float starts afresh. */
+void DockBreak::forgetFrame(QDockWidget *dock)
+{
+	explicitGeometry.remove(dock);
+	lastClient.remove(dock);
+	pendingRecord.remove(dock);
+}
+
+void DockBreak::rememberGeometry(QDockWidget *dock)
+{
+	if (store.set(dock->objectName(), dock->geometry()))
+		saveTimer.start();
+}
+
+/*
+ * Notes where a docked dock sits in the main window: the shape it starts from
+ * when it is next floated (placeAtDefault). Not a placement the layout repair
+ * is about to undo.
+ */
+void DockBreak::noteDocked(QDockWidget *dock)
+{
+	if (!dock->isFloating() && dock->isVisible() && !misplaced(dock))
+		lastDocked.insert(dock, dock->geometry());
+}
+
+/*
+ * Puts a just-floated dock at its default shape: the size and place it had
+ * docked, which is what Qt does the first time a dock is floated
+ * (QDockWidgetPrivate::setFloating: "Keep position when undocking for the
+ * first time"). Nothing if it has not been seen docked.
+ */
+void DockBreak::placeAtDefault(QDockWidget *dock)
+{
+	if (!main || !lastDocked.contains(dock))
+		return;
+
+	const QRect docked = lastDocked.value(dock);
+	const QRect target(main->mapToGlobal(docked.topLeft()), docked.size());
+	if (target == dock->geometry())
+		return;
+
+	/* The main window may be partly off screen; never float a dock where
+	 * the operator cannot reach it. */
+	if (!QGuiApplication::screenAt(target.center()))
+		return;
+
+	dock->setGeometry(target);
+}
