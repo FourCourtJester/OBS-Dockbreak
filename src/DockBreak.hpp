@@ -124,6 +124,7 @@ private:
 	void onTopLevelChanged(QPointer<QDockWidget> dock, bool floating);
 	void checkDocked(QPointer<QDockWidget> dock);
 	void redock(QPointer<QDockWidget> dock);
+	void scheduleRecord(QDockWidget *dock);
 	bool misplaced(QDockWidget *dock) const;
 
 public:
@@ -170,6 +171,13 @@ private:
 
 	/* When the dock layout was last rebuilt (see checkDocked). */
 	QElapsedTimer lastRepair;
+
+	/* Since a floating dock was last shown -- see the WindowActivate
+	 * handling in eventFilter. */
+	QElapsedTimer keepInFront;
+
+	/* Docks with a geometry recording queued (scheduleRecord). */
+	QSet<QDockWidget *> pendingRecord;
 
 	/* False until OBS has restored its saved layout. Until then OBS is the
 	 * authority on where floating docks go, and the plugin only releases

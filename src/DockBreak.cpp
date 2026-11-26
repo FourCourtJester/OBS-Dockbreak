@@ -61,6 +61,11 @@ static constexpr int DOCK_SETTLE_MS = 250;
  * when it docked as the size to float it at next time. */
 static constexpr int UNMAXIMISE_SETTLE_MS = 150;
 
+/* How long after a dock pops out OBS becoming active still puts it back in
+ * front. Popping out is a click in OBS; after that, clicking OBS is the
+ * operator bringing OBS forward, and is left alone. */
+static constexpr int KEEP_IN_FRONT_MS = 1500;
+
 /* The shortest gap between two layout repairs. */
 static constexpr int REPAIR_INTERVAL_MS = 2000;
 
@@ -119,6 +124,22 @@ static HWND covering_window(HWND hwnd)
  * place the window above all non-topmost windows, and it ends in the same
  * not-always-on-top state that Qt believes the dock to be in.
  */
+static void bring_to_front(HWND hwnd);
+
+/*
+ * Whether Windows has snapped the window (Aero Snap, Snap Layouts). A snapped
+ * window is not maximised -- to Qt it is an ordinary window of a new size --
+ * but Windows keeps its earlier size to restore it to, and so should we.
+ * IsWindowArranged is looked up at run time: it is only in newer user32s.
+ */
+static bool is_snapped(HWND hwnd)
+{
+	using IsWindowArrangedFn = BOOL(WINAPI *)(HWND);
+	static const IsWindowArrangedFn isArranged = reinterpret_cast<IsWindowArrangedFn>(
+		reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "IsWindowArranged")));
+	return hwnd && isArranged && isArranged(hwnd);
+}
+
 static void bring_to_front(HWND hwnd)
 {
 	const UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
@@ -176,15 +197,15 @@ void DockBreak::diag(QDockWidget *dock, const char *what) const
 
 	obs_log(LOG_INFO,
 		"diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d] "
-		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d minbox=%d maxbox=%d rect=%ld,%ld %ldx%ld "
+		"win[hwnd=%p owner=%p parent=%p vis=%d iconic=%d child=%d app=%d tool=%d minbox=%d maxbox=%d snapped=%d rect=%ld,%ld %ldx%ld "
 		"fg=%d above=%p%s]",
 		what, dock_name(dock).constData(), dock->isVisible(), dock->isHidden(), dock->isFloating(),
 		dock->testAttribute(Qt::WA_NativeWindow), area, tp, g.x(), g.y(), g.width(), g.height(),
 		static_cast<void *>(hwnd), static_cast<void *>(owner), static_cast<void *>(parent),
 		hwnd ? int(IsWindowVisible(hwnd)) : -1, hwnd ? int(IsIconic(hwnd)) : -1, int((st & WS_CHILD) != 0),
 		int((ex & WS_EX_APPWINDOW) != 0), int((ex & WS_EX_TOOLWINDOW) != 0), int((st & WS_MINIMIZEBOX) != 0),
-		int((st & WS_MAXIMIZEBOX) != 0), long(r.left), long(r.top), long(r.right - r.left),
-		long(r.bottom - r.top), int(foreground), static_cast<void *>(above),
+		int((st & WS_MAXIMIZEBOX) != 0), int(is_snapped(hwnd)), long(r.left), long(r.top),
+		long(r.right - r.left), long(r.bottom - r.top), int(foreground), static_cast<void *>(above),
 		above ? (aboveIsObs ? " (obs)" : " (other)") : "");
 #else
 	obs_log(LOG_INFO, "diag %-22s '%s' qt[vis=%d hidden=%d float=%d native=%d area=%d tp=%p geom=%d,%d %dx%d]",
@@ -406,15 +427,15 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 		}
 
 		/*
-		 * An owned window always stays above its owner. Released, a dock
-		 * goes under OBS as soon as OBS is activated -- including the
-		 * moment it is popped out, since that is a click in OBS. Putting
-		 * the docks back in front whenever OBS becomes active restores
-		 * what owning them did; Windows has finished raising OBS by the
-		 * time the deferred raise runs.
+		 * Popping a dock out is a click in OBS, and OBS becoming active
+		 * puts it above the unowned dock that just appeared. So for a
+		 * moment after a pop-out, OBS's activation puts the docks back in
+		 * front. Only for a moment: after that, clicking OBS is the
+		 * operator bringing OBS forward, over a maximised dock too.
 		 */
-		if (event->type() == QEvent::WindowActivate)
-			raiseFloating("obs-activated");
+		if (event->type() == QEvent::WindowActivate && keepInFront.isValid() &&
+		    keepInFront.elapsed() < KEEP_IN_FRONT_MS)
+			raiseFloating("obs-activated after a pop-out");
 
 		switch (event->type()) {
 		case QEvent::WindowStateChange:
@@ -459,10 +480,13 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 			 * taskbar) already brings it forward itself.
 			 */
 			if (!event->spontaneous()) {
-				QTimer::singleShot(0, this, [this, guarded = QPointer<QDockWidget>(dock)] {
-					if (guarded && tracked.contains(guarded.data()))
-						raiseDock(guarded, "raised (shown)");
-				});
+				keepInFront.start();
+				for (const int delay : {0, RAISE_AGAIN_MS}) {
+					QTimer::singleShot(delay, this, [this, guarded = QPointer<QDockWidget>(dock)] {
+						if (guarded && tracked.contains(guarded.data()))
+							raiseDock(guarded, "raised (shown)");
+					});
+				}
 			}
 		}
 		break;
@@ -505,17 +529,7 @@ bool DockBreak::eventFilter(QObject *watched, QEvent *event)
 			break;
 		}
 
-		/* Minimised, maximised or snapped full screen is not where the
-		 * dock lives: neither its frame nor its saved position should
-		 * follow it there. */
-		if (dock->isMinimized() || dock->isMaximized() || dock->isFullScreen())
-			break;
-
-		if (QWindow *window = dock->windowHandle(); window && window->type() == Qt::Window)
-			lastClient.insert(dock, dock->geometry());
-
-		if (loaded)
-			rememberGeometry(dock);
+		scheduleRecord(dock);
 		break;
 
 	default:
@@ -973,11 +987,45 @@ void DockBreak::redock(QPointer<QDockWidget> dock)
 	dock->setFloating(false);
 }
 
+/*
+ * Records where a floating dock is, once the move or resize that prompted it
+ * has finished: by then Windows has flagged a snap as one.
+ *
+ * Minimised, maximised, full screen or snapped is not where the dock lives,
+ * and is not recorded. Its frame (lastClient) and its saved position stay the
+ * last normal ones -- what Windows itself restores it to.
+ */
+void DockBreak::scheduleRecord(QDockWidget *dock)
+{
+	if (pendingRecord.contains(dock))
+		return;
+	pendingRecord.insert(dock);
+
+	QTimer::singleShot(0, this, [this, dock, guarded = QPointer<QDockWidget>(dock)] {
+		pendingRecord.remove(dock);
+		if (!guarded || !tracked.contains(dock) || !dock->isFloating() || !dock->isVisible())
+			return;
+		if (dock->isMinimized() || dock->isMaximized() || dock->isFullScreen())
+			return;
+#ifdef _WIN32
+		if (is_snapped(reinterpret_cast<HWND>(dock->internalWinId())))
+			return;
+#endif
+
+		if (QWindow *window = dock->windowHandle(); window && window->type() == Qt::Window)
+			lastClient.insert(dock, dock->geometry());
+
+		if (loaded)
+			rememberGeometry(dock);
+	});
+}
+
 /* A docked dock has no frame of ours: the next float starts afresh. */
 void DockBreak::forgetFrame(QDockWidget *dock)
 {
 	explicitGeometry.remove(dock);
 	lastClient.remove(dock);
+	pendingRecord.remove(dock);
 }
 
 void DockBreak::rememberGeometry(QDockWidget *dock)
